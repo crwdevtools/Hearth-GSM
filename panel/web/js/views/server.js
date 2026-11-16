@@ -230,19 +230,47 @@ async function consoleTab(panel, ctx) {
   jump.addEventListener("click", () => { out.scrollTop = out.scrollHeight; });
 
   let carry = "";
+  // Output is queued and drawn once per frame: the history that arrives when the console opens
+  // (or a burst of log spam) appears in a single update instead of scrolling in line by line.
+  let pending = [];
+  let frame = 0;
   function write(text, cls) {
-    if (!cls) {
-      // A colour code can be split across two chunks; hold back an unfinished one.
-      text = carry + text.replace(/\r\n/g, "\n");
-      // eslint-disable-next-line no-control-regex
-      const partial = text.match(/\x1b(\[[0-9;?]*)?$|§$/);
-      carry = partial ? partial[0] : "";
-      if (partial) text = text.slice(0, partial.index);
+    pending.push([text, cls]);
+    if (pending.length > MAX_NODES) pending = pending.slice(-MAX_NODES);  // tab in the background
+    if (!frame) frame = requestAnimationFrame(flush);
+  }
+  function flush() {
+    frame = 0;
+    const batch = pending;
+    pending = [];
+    const fragment = document.createDocumentFragment();
+    for (let [text, cls] of batch) {
+      if (!cls) {
+        // A colour code can be split across two chunks; hold back an unfinished one.
+        text = carry + text.replace(/\r\n/g, "\n");
+        // eslint-disable-next-line no-control-regex
+        const partial = text.match(/\x1b(\[[0-9;?]*)?$|§$/);
+        carry = partial ? partial[0] : "";
+        if (partial) text = text.slice(0, partial.index);
+      }
+      fragment.append(...(cls ? [h("span", { class: cls }, text)] : ansiToNodes(text, ansiState)));
     }
-    const nodes = cls ? [h("span", { class: cls }, text)] : ansiToNodes(text, ansiState);
-    out.append(...nodes);
-    while (out.childNodes.length > MAX_NODES) out.firstChild.remove();
+    out.append(fragment);
+    const extra = out.childNodes.length - MAX_NODES;
+    if (extra > 0) {
+      const range = document.createRange();
+      range.setStartBefore(out.firstChild);
+      range.setEndAfter(out.childNodes[extra - 1]);
+      range.deleteContents();
+    }
     if (stick) out.scrollTop = out.scrollHeight;
+  }
+  function clearConsole() {
+    pending = [];
+    carry = "";
+    ansiState.color = null;
+    ansiState.bold = false;
+    out.replaceChildren();
   }
 
   // ----- stats ---------------------------------------------------------------------------------
@@ -274,22 +302,30 @@ async function consoleTab(panel, ctx) {
   const history = [];
   let historyIndex = -1;
 
+  let reconnected = false;
   function connect() {
     ws = socket(`/servers/${s.id}/console`);
+    let fresh = true;
     ws.onopen = () => {
       retry = 0;
-      if (out.childNodes.length) write("— reconnected —\n", "sys");
     };
     ws.onmessage = (event) => {
       let msg;
       try { msg = JSON.parse(event.data); } catch { return; }
-      if (msg.type === "log") write(msg.data);
+      if (msg.type === "log") {
+        // After a reconnect the node sends its recent history again: show it in place of what's
+        // on screen rather than appending a second copy.
+        if (fresh && reconnected) clearConsole();
+        fresh = false;
+        write(msg.data);
+      }
       else if (msg.type === "status") ctx.setStatus(msg.data);
       else if (msg.type === "error") write(`${msg.data}\n`, "err");
     };
     ws.onclose = () => {
       if (closed) return;
       const wait = Math.min(15000, 1000 * 2 ** retry++);
+      reconnected = true;
       retryTimer = setTimeout(connect, wait);
     };
   }
@@ -326,6 +362,7 @@ async function consoleTab(panel, ctx) {
   return () => {
     closed = true;
     clearTimeout(retryTimer);
+    cancelAnimationFrame(frame);
     ws?.close();
   };
 }

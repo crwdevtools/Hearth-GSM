@@ -319,6 +319,11 @@ def create_app(config: AgentConfig | None = None, docker_factory: Callable[[], A
     return app
 
 
+LOG_BATCH_WINDOW = 0.05  # seconds to gather a burst of console output into one message
+LOG_BATCH_MAX = 512 * 1024  # characters per message
+CONSOLE_HISTORY_LINES = 500  # lines of history sent when a console opens
+
+
 class ConsoleSession:
     """Streams container output and status to one socket; accepts commands back."""
 
@@ -339,7 +344,7 @@ class ConsoleSession:
 
     def _follow_logs(self, since: float | None) -> None:
         """Blocking: read container output until the stream ends (container stopped)."""
-        stream = self.manager.log_stream(self.uuid, tail=200, since=since)
+        stream = self.manager.log_stream(self.uuid, tail=CONSOLE_HISTORY_LINES, since=since)
         if stream is None:
             return
         self._stream = stream
@@ -358,7 +363,7 @@ class ConsoleSession:
                 stream.close()
 
     async def _logs_forever(self) -> None:
-        since: float | None = None  # first attach: last 200 lines
+        since: float | None = None  # first attach: the recent history
         while not self.closed:
             await asyncio.to_thread(self._follow_logs, since)
             # Re-attach from where this stream ended, so lines printed while the container was
@@ -376,7 +381,27 @@ class ConsoleSession:
     async def _sender(self) -> None:
         while True:
             message = await self.queue.get()
-            await self.ws.send_json(message)
+            if message["type"] != "log":
+                await self.ws.send_json(message)
+                continue
+            # Output arrives from Docker a line at a time. Wait a moment and send everything that
+            # came in meanwhile as one message, so the history shown on (re)connect, or a long
+            # stack trace, reaches the browser in one piece instead of hundreds of tiny messages.
+            await asyncio.sleep(LOG_BATCH_WINDOW)
+            parts, others, size = [message["data"]], [], len(message["data"])
+            while size < LOG_BATCH_MAX:
+                try:
+                    nxt = self.queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                if nxt["type"] == "log":
+                    parts.append(nxt["data"])
+                    size += len(nxt["data"])
+                else:
+                    others.append(nxt)
+            await self.ws.send_json({"type": "log", "data": "".join(parts)})
+            for other in others:
+                await self.ws.send_json(other)
 
     async def _receiver(self) -> None:
         while True:

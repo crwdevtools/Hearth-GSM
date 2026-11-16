@@ -190,3 +190,19 @@ def test_out_of_memory_kill_is_reported_clearly(tmp_path):
         agent.put(f"/api/servers/{UUID}", json={**SPEC, "memory_mb": 4096}, headers=AUTH)
         wait_for(agent, "running")
         assert agent.get(f"/api/servers/{UUID}", headers=AUTH).json()["error"] is None
+
+
+def test_console_history_arrives_in_one_message(agent):
+    """Opening (or refreshing) the console sends the recent history as one message, not a line
+    at a time, so the browser draws it in a single update."""
+    agent.put(f"/api/servers/{UUID}", json=SPEC, headers=AUTH)
+    wait_for(agent, "offline")
+    agent.post(f"/api/servers/{UUID}/power", json={"action": "start"}, headers=AUTH)
+    wait_for(agent, "running")
+    container = agent.app.state.manager.docker.containers.get(f"hearth-{UUID}")
+    for i in range(300):
+        container._log(f"[Server thread/INFO]: line {i}")
+
+    with agent.websocket_connect(f"/api/servers/{UUID}/console", headers=AUTH) as ws:
+        first_log = next(m for m in (ws.receive_json() for _ in range(5)) if m["type"] == "log")
+    assert "line 0\r\n" in first_log["data"] and "line 299\r\n" in first_log["data"]
