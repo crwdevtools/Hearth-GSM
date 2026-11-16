@@ -1,0 +1,34 @@
+# Panel + an agent for this machine. Remote machines run only the agent (see README).
+services:
+  panel:
+    build: ./panel
+    restart: unless-stopped
+    ports:
+      - "${HEARTH_PANEL_PORT:-8000}:8000"
+    env_file: .env
+    environment:
+      HEARTH_LOCAL_NODE_URL: http://agent:8080
+    volumes:
+      - panel-data:/var/lib/hearth-panel
+    depends_on:
+      - agent
+
+  agent:
+    build: ./agent
+    image: hearth-agent:latest
+    restart: unless-stopped
+    environment:
+      HEARTH_AGENT_TOKEN: ${HEARTH_AGENT_TOKEN:?Set HEARTH_AGENT_TOKEN in .env}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Game server files: HEARTH_DATA_DIR is a folder on this computer, on any drive
+      # (D:\Hearth, /mnt/games/hearth, ...). The agent detects where it is on the host.
+      - type: bind
+        source: ${HEARTH_DATA_DIR:-/var/lib/hearth}
+        target: /var/lib/hearth
+        bind:
+          create_host_path: true
+    # Not published: only the panel talks to it, over the compose network.
+
+volumes:
+  panel-data:

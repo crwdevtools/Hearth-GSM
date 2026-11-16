@@ -1,0 +1,502 @@
+"""Panel features: sharing, quotas, 2FA, API tokens, backups, schedules, players, mods, events,
+suspension, cloning, joinability, auto-sleep."""
+
+import time
+from datetime import datetime, timezone
+
+import pytest
+
+from hearth_panel.security import totp_now
+
+
+def _create(client, node, **extra):
+    body = {"name": "Survival", "node_id": node["id"], "template": "minecraft-java", "memory_mb": 4096,
+            "accept_eula": True, "variables": {"TYPE": "PAPER", "VERSION": "1.21.4"}}
+    body.update(extra)
+    r = client.post("/api/servers", json=body)
+    assert r.status_code == 201, r.text
+    return r.json()
+
+
+def _login(client, username, password, code=None):
+    client.post("/api/auth/logout")
+    body = {"username": username, "password": password}
+    if code:
+        body["totp_code"] = code
+    return client.post("/api/auth/login", json=body)
+
+
+def _user(client, name, **extra):
+    r = client.post("/api/users", json={"username": name, "password": f"{name}-password-1", **extra})
+    assert r.status_code == 201, r.text
+    return r.json()
+
+
+# ----- sharing -----------------------------------------------------------------------------------
+
+
+def test_share_grants_only_chosen_permissions(admin, node, agent):
+    sid = _create(admin, node)["id"]
+    _user(admin, "friend")
+    r = admin.post(f"/api/servers/{sid}/shares", json={"username": "friend", "permissions": ["console", "power"]})
+    assert r.status_code == 201
+    _login(admin, "friend", "friend-password-1")
+    servers = admin.get("/api/servers").json()
+    assert [s["id"] for s in servers] == [sid]
+    assert set(servers[0]["permissions"]) == {"console", "power"}
+    assert admin.post(f"/api/servers/{sid}/command", json={"command": "say hi"}).status_code == 200
+    assert admin.post(f"/api/servers/{sid}/power", json={"action": "restart"}).status_code == 202
+    assert admin.get(f"/api/servers/{sid}/files").status_code == 403
+    assert admin.get(f"/api/servers/{sid}/backups").status_code == 403
+    assert admin.patch(f"/api/servers/{sid}", json={"name": "mine"}).status_code == 403
+    assert admin.delete(f"/api/servers/{sid}").status_code == 403
+    assert admin.get(f"/api/servers/{sid}/shares").status_code == 403
+
+
+def test_share_validation(admin, node):
+    sid = _create(admin, node)["id"]
+    assert admin.post(f"/api/servers/{sid}/shares", json={"username": "ghost"}).status_code == 404
+    _user(admin, "friend")
+    assert admin.post(f"/api/servers/{sid}/shares", json={"username": "friend", "permissions": ["root"]}).status_code == 422
+    share = admin.post(f"/api/servers/{sid}/shares", json={"username": "friend"}).json()
+    assert admin.post(f"/api/servers/{sid}/shares", json={"username": "friend"}).status_code == 409
+    r = admin.put(f"/api/servers/{sid}/shares/{share['id']}", json={"permissions": ["files"]})
+    assert r.json()["permissions"] == ["files"]
+    assert admin.delete(f"/api/servers/{sid}/shares/{share['id']}").status_code == 204
+
+
+# ----- quotas ------------------------------------------------------------------------------------
+
+
+def test_quota_lets_friends_create_within_limits(admin, node):
+    _user(admin, "builder", max_servers=1, max_memory_mb=6144)
+    _login(admin, "builder", "builder-password-1")
+    mine = _create(admin, node, memory_mb=4096)
+    assert mine["owner"]["username"] == "builder"
+    r = admin.post("/api/servers", json={"name": "x", "node_id": node["id"], "template": "minecraft-java",
+                                         "memory_mb": 2048, "accept_eula": True})
+    assert r.status_code == 403 and "quota allows 1" in r.json()["detail"]
+    assert admin.patch(f"/api/servers/{mine['id']}", json={"memory_mb": 6144}).status_code == 200
+    r = admin.patch(f"/api/servers/{mine['id']}", json={"memory_mb": 8192})
+    assert r.status_code == 403 and "memory left" in r.json()["detail"]
+
+
+def test_no_quota_no_create(admin, node):
+    _user(admin, "friend")
+    _login(admin, "friend", "friend-password-1")
+    r = admin.post("/api/servers", json={"name": "x", "node_id": node["id"], "template": "minecraft-java",
+                                         "memory_mb": 2048, "accept_eula": True})
+    assert r.status_code == 403
+
+
+# ----- 2FA and API tokens ------------------------------------------------------------------------
+
+
+def _fresh_totp_window():
+    """These tests compare codes across 30-second steps; don't start one just before a boundary."""
+    if time.time() % 30 > 24:
+        time.sleep(30 - time.time() % 30 + 0.2)
+
+
+def test_two_factor_login(admin):
+    _fresh_totp_window()
+    setup = admin.post("/api/account/2fa/setup").json()
+    assert setup["uri"].startswith("otpauth://totp/Hearth:admin") and "<svg" in setup["qr_svg"]
+    assert admin.post("/api/account/2fa/enable", json={"code": "000000"}).status_code == 400
+    assert admin.post("/api/account/2fa/enable", json={"code": totp_now(setup["secret"])}).status_code == 200
+
+    r = _login(admin, "admin", "correct-horse-battery")
+    assert r.status_code == 401 and r.json()["totp_required"] is True
+    assert admin.get("/api/servers").status_code == 401
+    assert _login(admin, "admin", "correct-horse-battery", "123456").status_code == 401
+    # The code that turned 2FA on was already used once; it can't sign anyone in.
+    assert _login(admin, "admin", "correct-horse-battery", totp_now(setup["secret"])).status_code == 401
+    assert _login(admin, "admin", "correct-horse-battery", totp_now(setup["secret"], time.time() + 90)).status_code == 401
+    assert _login(admin, "admin", "correct-horse-battery", totp_now(setup["secret"], time.time() + 30)).status_code == 200
+    assert admin.get("/api/servers").status_code == 200
+
+    r = admin.post("/api/account/2fa/disable", json={"password": "correct-horse-battery",
+                                                     "code": totp_now(setup["secret"])})
+    assert r.json()["enabled"] is False
+
+
+def test_two_factor_code_cannot_be_replayed(admin):
+    _fresh_totp_window()
+    _user(admin, "friend")
+    _login(admin, "friend", "friend-password-1")
+    secret = admin.post("/api/account/2fa/setup").json()["secret"]
+    admin.post("/api/account/2fa/enable", json={"code": totp_now(secret, time.time() - 30)})
+    code = totp_now(secret)
+    assert _login(admin, "friend", "friend-password-1", code).status_code == 200
+    assert _login(admin, "friend", "friend-password-1", code).status_code == 401  # someone who saw it
+
+
+def test_admin_can_reset_a_friends_2fa(admin):
+    friend = _user(admin, "friend")
+    _login(admin, "friend", "friend-password-1")
+    secret = admin.post("/api/account/2fa/setup").json()["secret"]
+    admin.post("/api/account/2fa/enable", json={"code": totp_now(secret)})
+    _login(admin, "admin", "correct-horse-battery")
+    assert admin.patch(f"/api/users/{friend['id']}", json={"reset_2fa": True}).json()["totp_enabled"] is False
+    assert _login(admin, "friend", "friend-password-1").status_code == 200
+
+
+def test_api_tokens(admin, node, client):
+    sid = _create(admin, node)["id"]
+    token = admin.post("/api/account/tokens", json={"name": "billing"}).json()["token"]
+    assert token.startswith("hearth_")
+    admin.post("/api/auth/logout")
+    headers = {"Authorization": f"Bearer {token}"}
+    assert client.get("/api/servers", headers=headers).status_code == 200
+    assert client.post(f"/api/servers/{sid}/suspend", json={"reason": "unpaid"}, headers=headers).status_code == 200
+    assert client.get("/api/servers", headers={"Authorization": "Bearer hearth_nope_x"}).status_code == 401
+    listed = client.get("/api/account/tokens", headers=headers).json()
+    assert listed[0]["last_used"] is not None and "token" not in listed[0]
+    assert client.delete(f"/api/account/tokens/{listed[0]['id']}", headers=headers).status_code == 204
+    assert client.get("/api/servers", headers=headers).status_code == 401
+
+
+# ----- suspension --------------------------------------------------------------------------------
+
+
+def test_suspended_server_cannot_be_started_by_owner(admin, node, agent):
+    friend = _user(admin, "friend")
+    sid = _create(admin, node, owner_id=friend["id"])["id"]
+    assert admin.post(f"/api/servers/{sid}/suspend", json={"reason": "unpaid"}).json()["suspended"] is True
+    assert (sid and agent.power[-1][1]) == "stop"
+    _login(admin, "friend", "friend-password-1")
+    r = admin.post(f"/api/servers/{sid}/power", json={"action": "start"})
+    assert r.status_code == 403 and "unpaid" in r.json()["detail"]
+    _login(admin, "admin", "correct-horse-battery")
+    assert admin.post(f"/api/servers/{sid}/unsuspend").json()["suspended"] is False
+
+
+# ----- backups -----------------------------------------------------------------------------------
+
+
+def _wait_backups(client, sid, state="ready"):
+    import time
+
+    for _ in range(200):
+        rows = client.get(f"/api/servers/{sid}/backups").json()
+        if rows and all(r["state"] == state for r in rows):
+            return rows
+        time.sleep(0.02)
+    raise AssertionError(rows)
+
+
+def test_backup_lifecycle(admin, node, agent):
+    sid = _create(admin, node)["id"]
+    r = admin.post(f"/api/servers/{sid}/backups", json={"name": "Before the dragon"})
+    assert r.status_code == 202
+    rows = _wait_backups(admin, sid)
+    assert rows[0]["name"] == "Before the dragon" and rows[0]["size"] == 4096
+    bid = rows[0]["id"]
+    assert admin.get(f"/api/servers/{sid}/backups/{bid}/download").content == b"tar-bytes"
+    assert admin.patch(f"/api/servers/{sid}/backups/{bid}", json={"locked": True}).json()["locked"]
+    assert admin.delete(f"/api/servers/{sid}/backups/{bid}").status_code == 409
+
+    assert admin.post(f"/api/servers/{sid}/backups/{bid}/restore", json={"backup_first": True}).status_code == 202
+    kinds = [b["kind"] for b in admin.get(f"/api/servers/{sid}/backups").json()]
+    assert "pre-restore" in kinds and len(agent.restored) == 1
+
+    admin.patch(f"/api/servers/{sid}/backups/{bid}", json={"locked": False})
+    assert admin.delete(f"/api/servers/{sid}/backups/{bid}").status_code == 204
+
+
+def test_failed_backup_blocks_auto_update(admin, node, agent, public):
+    sid = _create(admin, node, modpack={"provider": "modrinth", "project_id": "cool-pack"}, auto_update=True)["id"]
+    agent.fail_backups = True
+    public.versions.insert(0, {"id": "v4", "name": "Pack 4.0", "game_versions": ["1.21.4"],
+                               "version_type": "release", "date_published": "2026-11-10T00:00:00Z"})
+    admin.post("/api/admin/updates/run")
+    server = admin.get(f"/api/servers/{sid}").json()
+    assert server["modpack"]["version_id"] == "v2"  # left alone
+    assert server["modpack"]["update"]["id"] == "v4"
+
+
+def test_version_change_takes_safety_backup(admin, node, agent):
+    sid = _create(admin, node)["id"]
+    admin.put(f"/api/servers/{sid}/source", json={"kind": "software", "server_type": "FABRIC", "version": "1.21.4"})
+    assert [b["kind"] for b in admin.get(f"/api/servers/{sid}/backups").json()] == ["pre-update"]
+    agent.fail_backups = True
+    r = admin.put(f"/api/servers/{sid}/source", json={"kind": "software", "server_type": "PAPER", "version": "1.21.4"})
+    assert r.status_code == 409 and "safety backup failed" in r.json()["detail"]
+
+
+# ----- schedules ---------------------------------------------------------------------------------
+
+
+def test_schedule_validation_and_preview(admin, node):
+    sid = _create(admin, node)["id"]
+    r = admin.post(f"/api/servers/{sid}/schedules", json={"name": "x", "cron": "99 * * * *", "action": "restart"})
+    assert r.status_code == 422 and "between 0 and 59" in r.json()["detail"]
+    r = admin.post(f"/api/servers/{sid}/schedules", json={"name": "x", "cron": "0 4 * * *", "action": "command"})
+    assert r.status_code == 400
+    assert len(admin.get(f"/api/servers/{sid}/schedules/preview", params={"cron": "@daily"}).json()["next"]) == 3
+
+
+@pytest.mark.anyio
+async def test_scheduler_runs_due_tasks_once(admin, node, agent):
+    sid = _create(admin, node)["id"]
+    assert admin.put("/api/admin/settings", json={"timezone": "America/Toronto"}).status_code == 200
+    admin.post(f"/api/servers/{sid}/schedules", json={"name": "Greeting", "cron": "30 4 * * *",
+                                                     "action": "command", "payload": "say good morning"})
+    admin.post(f"/api/servers/{sid}/schedules", json={"name": "Nightly", "cron": "30 4 * * *",
+                                                     "action": "backup", "keep_backups": 1})
+    scheduler = admin.app.state.scheduler
+    assert await scheduler.tick(datetime(2026, 11, 16, 4, 30, tzinfo=timezone.utc)) == 0  # 4:30 UTC is 23:30 Toronto
+    at = datetime(2026, 11, 16, 9, 30, 5, tzinfo=timezone.utc)  # 4:30 in Toronto (EST, UTC-5)
+    assert await scheduler.tick(at) == 2
+    assert await scheduler.tick(at) == 0  # same minute: not again
+    for task in list(scheduler._running):
+        await task
+    assert (sid and any(c == "say good morning" for _, c in agent.commands))
+    rows = admin.get(f"/api/servers/{sid}/schedules").json()["schedules"]
+    assert all(r["last_result"] for r in rows)
+    assert await scheduler.tick(datetime(2026, 11, 16, 9, 31, tzinfo=timezone.utc)) == 0
+
+
+@pytest.fixture
+def anyio_backend():
+    return "asyncio"
+
+
+# ----- players & mods ----------------------------------------------------------------------------
+
+
+def test_players_overview_and_actions(admin, node, agent):
+    sid = _create(admin, node)["id"]
+    agent.command_output = "There are 2 of a max of 20 players online: alex, sam\n"
+    agent.files["/whitelist.json"] = '[{"uuid": "x", "name": "alex"}]'
+    agent.files["/banned-players.json"] = '[{"name": "griefer", "reason": "lava"}]'
+    data = admin.get(f"/api/servers/{sid}/players").json()
+    assert data["online"] == ["alex", "sam"] and data["max"] == 20
+    assert data["whitelist"] == ["alex"] and data["banned"][0]["reason"] == "lava"
+    admin.post(f"/api/servers/{sid}/players", json={"action": "ban", "name": "sam", "reason": "spam\nnow"})
+    assert agent.commands[-1][1] == "ban sam spam now"
+    r = admin.post(f"/api/servers/{sid}/players", json={"action": "op", "name": "bad name!"})
+    assert r.status_code == 422
+
+
+def test_plugin_install_includes_required_dependency(admin, node, agent):
+    sid = _create(admin, node)["id"]
+    found = admin.get(f"/api/servers/{sid}/mods/search").json()
+    assert found["target"]["kind"] == "plugin" and found["target"]["folder"] == "/plugins"
+    r = admin.post(f"/api/servers/{sid}/mods", json={"project_id": "PLUGIN01"})
+    assert r.json()["installed"] == ["plugin01.jar", "dep00001.jar"]
+    assert {f["path"] for f in agent.fetched} == {"/plugins/plugin01.jar", "/plugins/dep00001.jar"}
+
+
+def test_vanilla_cannot_take_mods(admin, node):
+    sid = _create(admin, node, variables={"TYPE": "VANILLA", "VERSION": "1.21.4"})["id"]
+    r = admin.get(f"/api/servers/{sid}/mods")
+    assert r.status_code == 400 and "Vanilla" in r.json()["detail"]
+
+
+# ----- events, Discord, webhooks, activity -------------------------------------------------------
+
+
+def test_discord_and_webhooks_receive_events(admin, node, public):
+    sid = _create(admin, node)["id"]
+    hook = "https://discord.com/api/webhooks/123/abc"
+    assert admin.patch(f"/api/servers/{sid}", json={"discord_webhook": "https://evil.example"}).status_code == 422
+    admin.patch(f"/api/servers/{sid}", json={"discord_webhook": hook})
+    created = admin.post("/api/admin/webhooks", json={"url": "https://billing.example/hook",
+                                                      "events": ["server.suspended"]}).json()
+    assert len(created["secret"]) == 48
+    admin.post(f"/api/servers/{sid}/suspend", json={"reason": "test"})
+    import time
+
+    for _ in range(100):
+        if len(public.posts) >= 2:
+            break
+        time.sleep(0.02)
+    urls = [u for u, _ in public.posts]
+    assert hook in urls and "https://billing.example/hook" in urls
+    discord_body = next(b for u, b in public.posts if u == hook)
+    assert discord_body["embeds"][0]["title"] == "Survival was suspended"
+    log = admin.get("/api/admin/activity").json()
+    assert {"server.created", "server.suspended"} <= {e["action"] for e in log}
+
+
+# ----- clone, join check, metrics ----------------------------------------------------------------
+
+
+def test_clone_copies_files_to_new_port(admin, node, agent):
+    src = _create(admin, node)
+    r = admin.post(f"/api/servers/{src['id']}/clone", json={"name": "Test copy"})
+    assert r.status_code == 201, r.text
+    copy = r.json()
+    assert copy["address"].endswith(":25566") and copy["uuid"] != src["uuid"]
+    assert (copy["uuid"], src["uuid"]) in agent.copies
+
+
+def test_join_check_reports_reachability(admin, node, agent, public):
+    sid = _create(admin, node)["id"]
+    data = admin.get(f"/api/servers/{sid}/join-check").json()
+    keys = {c["key"]: c for c in data["checks"]}
+    assert keys["running"]["ok"] is False and data["address"] == "play.example.net:25565"
+    assert keys["internet"]["ok"] is None  # not checked while the server is off
+
+
+def test_tunnel_address_replaces_node_address(admin, node):
+    sid = _create(admin, node)["id"]
+    r = admin.patch(f"/api/servers/{sid}", json={"public_address": "abc.joinmc.link:4433"})
+    assert r.json()["address"] == "abc.joinmc.link:4433"
+    assert r.json()["direct_address"] == "play.example.net:25565"
+    assert admin.patch(f"/api/servers/{sid}", json={"public_address": "bad address!"}).status_code == 422
+
+
+def test_metrics_proxy(admin, node):
+    sid = _create(admin, node)["id"]
+    data = admin.get(f"/api/servers/{sid}/metrics").json()
+    assert data["minutes"][0]["cpu"] == 5.0 and data["memory_limit"] == 4096 * 1048576
+
+
+# ----- monitor: events + auto-sleep --------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_monitor_emits_transitions_and_puts_empty_servers_to_sleep(admin, node, agent):
+    sid = _create(admin, node)["id"]
+    admin.patch(f"/api/servers/{sid}", json={"auto_stop_minutes": 10})
+    monitor = admin.app.state.monitor
+    state = {"value": "offline"}
+    original = agent.__call__
+
+    import httpx
+
+    def patched(request):
+        if request.url.path == "/api/servers":
+            return httpx.Response(200, json=[{"uuid": u, "state": state["value"], "restarts": 0, "oom_kills": 0}
+                                             for u in agent.specs])
+        return original(request)
+
+    admin.app.state.ctx.nodes.http._transport = httpx.MockTransport(patched)
+    agent.command_output = "There are 0 of a max of 20 players online:"
+    await monitor.tick(now=0)  # first sight
+    state["value"] = "running"
+    await monitor.tick(now=15)  # started + first empty check
+    await monitor.tick(now=15 + 61)  # still empty, < 10 min
+    assert agent.slept == []
+    await monitor.tick(now=15 + 61 + 600)  # 10+ minutes empty
+    assert len(agent.slept) == 1
+    actions = [e["action"] for e in admin.get(f"/api/servers/{sid}/activity").json()]
+    assert "server.started" in actions
+
+
+def test_join_check_when_running(admin, node, agent, public):
+    import httpx
+
+    sid = _create(admin, node)["id"]
+    original = agent.__call__
+
+    def running(request):
+        if request.url.path == "/api/servers":
+            return httpx.Response(200, json=[{"uuid": u, "state": "running"} for u in agent.specs])
+        return original(request)
+
+    admin.app.state.ctx.nodes.http._transport = httpx.MockTransport(running)
+    ok = {c["key"]: c for c in admin.get(f"/api/servers/{sid}/join-check").json()["checks"]}
+    assert ok["internet"]["ok"] is True and "1/20" in ok["internet"]["detail"]
+    public.reachable = False
+    admin.app.state.ctx.cache.invalidate()
+    bad = {c["key"]: c for c in admin.get(f"/api/servers/{sid}/join-check").json()["checks"]}
+    assert bad["internet"]["ok"] is False and "port 25565/TCP" in bad["internet"]["detail"]
+
+
+# ----- bug-check regressions ---------------------------------------------------------------------
+
+
+def test_schedules_need_the_permission_they_use(admin, node, agent):
+    sid = _create(admin, node)["id"]
+    _user(admin, "friend")
+    admin.post(f"/api/servers/{sid}/shares", json={"username": "friend", "permissions": ["schedules"]})
+    _login(admin, "friend", "friend-password-1")
+    body = {"name": "Op me", "cron": "* * * * *", "action": "command", "payload": "op friend"}
+    r = admin.post(f"/api/servers/{sid}/schedules", json=body)
+    assert r.status_code == 403 and "console" in r.json()["detail"]
+    assert admin.post(f"/api/servers/{sid}/schedules",
+                      json={"name": "x", "cron": "0 4 * * *", "action": "restart"}).status_code == 403
+    _login(admin, "admin", "correct-horse-battery")
+    sched = admin.post(f"/api/servers/{sid}/schedules", json=body).json()
+    _login(admin, "friend", "friend-password-1")
+    assert admin.post(f"/api/servers/{sid}/schedules/{sched['id']}/run").status_code == 403
+    assert not any(c == "op friend" for _, c in agent.commands)
+
+
+@pytest.mark.anyio
+async def test_scheduled_restart_leaves_a_stopped_server_alone(admin, node, agent):
+    sid = _create(admin, node)["id"]
+    sched = admin.post(f"/api/servers/{sid}/schedules",
+                       json={"name": "Nightly", "cron": "0 4 * * *", "action": "restart"}).json()
+    scheduler = admin.app.state.scheduler
+    agent.power.clear()
+    agent.state = "offline"
+    assert (await scheduler.execute(sched["id"])).startswith("Skipped")
+    agent.state = "sleeping"
+    assert (await scheduler.execute(sched["id"])).startswith("Skipped")
+    assert agent.power == []
+    agent.state = "running"
+    assert await scheduler.execute(sched["id"]) == "Restarted."
+    assert agent.power[-1][1] == "restart"
+
+
+def test_suspended_server_cannot_be_cloned_by_its_owner(admin, node, agent):
+    friend = _user(admin, "friend", max_servers=5)
+    sid = _create(admin, node, owner_id=friend["id"])["id"]
+    admin.post(f"/api/servers/{sid}/suspend", json={"reason": "unpaid"})
+    _login(admin, "friend", "friend-password-1")
+    r = admin.post(f"/api/servers/{sid}/clone", json={"name": "Escape", "copy_files": False})
+    assert r.status_code == 403 and "suspended" in r.json()["detail"]
+
+
+@pytest.mark.anyio
+async def test_unfinished_backups_are_picked_up_after_a_panel_restart(admin, node, agent):
+    from hearth_panel.models import Backup
+    from hearth_panel.services import backups as jobs
+
+    sid = _create(admin, node)["id"]
+    ctx = admin.app.state.ctx
+    with ctx.db.sessionmaker() as db:
+        row = Backup(server_id=sid, name="Interrupted", kind="manual", state="creating")
+        db.add(row)
+        db.commit()
+        uuid = row.uuid
+    assert admin.post(f"/api/servers/{sid}/backups", json={}).status_code == 409  # blocked, as before
+    assert admin.delete(f"/api/servers/{sid}/backups/{row.id}").status_code == 409
+    agent.backups[uuid] = {"state": "ready", "size": 2048}  # the node finished it meanwhile
+    assert jobs.resume_pending(ctx) == 1
+    for task in list(jobs._tasks):
+        await task
+    assert admin.get(f"/api/servers/{sid}/backups").json()[0]["state"] == "ready"
+    assert admin.post(f"/api/servers/{sid}/backups", json={}).status_code == 202
+
+
+def test_join_check_local_address_detection():
+    from hearth_panel.routers.servers import _is_local_host
+
+    assert _is_local_host("192.168.1.20") and _is_local_host("10.0.0.5") and _is_local_host("172.20.0.1")
+    assert _is_local_host("localhost") and _is_local_host("100.72.1.1")  # CGNAT
+    assert not _is_local_host("172.67.1.1")  # public (outside 172.16.0.0/12)
+    assert not _is_local_host("mc.example.com") and not _is_local_host("8.8.8.8")
+
+
+def test_admin_password_reset_revokes_api_tokens(admin, client):
+    friend = _user(admin, "friend")
+    _login(admin, "friend", "friend-password-1")
+    token = admin.post("/api/account/tokens", json={"name": "bot"}).json()["token"]
+    headers = {"Authorization": f"Bearer {token}"}
+    assert client.get("/api/servers", headers=headers).status_code == 200
+    _login(admin, "admin", "correct-horse-battery")
+    admin.patch(f"/api/users/{friend['id']}", json={"password": "a-brand-new-password"})
+    assert client.get("/api/servers", headers=headers).status_code == 401
+
+
+def test_password_guessing_is_throttled_for_signed_in_sessions(admin):
+    for _ in range(8):
+        r = admin.post("/api/auth/password", json={"current_password": "nope-nope-nope", "new_password": "x" * 12})
+        assert r.status_code == 400
+    r = admin.post("/api/auth/password", json={"current_password": "correct-horse-battery", "new_password": "x" * 12})
+    assert r.status_code == 429
