@@ -74,7 +74,14 @@ for /f "tokens=2 delims==" %%p in ('findstr /b "HEARTH_PANEL_PORT=" .env') do se
 
 echo.
 echo Building and starting Hearth. The first run takes a few minutes...
-docker compose up -d --build
+rem --pull fetches the latest Python base image, so its security fixes reach the panel and agent.
+rem Offline, fall back to the copy already on this machine.
+docker compose build --pull
+if errorlevel 1 (
+  echo Couldn't check for a newer base image; using the one on this machine.
+  docker compose build
+)
+if not errorlevel 1 docker compose up -d
 if errorlevel 1 (
   echo.
   echo Starting the containers failed. The messages above say why.

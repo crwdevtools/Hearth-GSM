@@ -92,6 +92,7 @@ def create_app(context: PanelContext | None = None, *, run_updater: bool = True)
         response = await call_next(request)
         response.headers.setdefault("Content-Security-Policy", CSP)
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "DENY")  # frame-ancestors, for older browsers
         response.headers.setdefault("Referrer-Policy", "same-origin")
         if request.url.path.startswith("/api/"):
             response.headers.setdefault("Cache-Control", "no-store")

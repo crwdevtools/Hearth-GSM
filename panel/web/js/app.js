@@ -114,7 +114,7 @@ async function boot() {
   if (!state.me) {
     if (typeof state.cleanup === "function") state.cleanup();
     clear(app);
-    renderAuth(app, { needsSetup: auth.needs_setup, onDone: boot });
+    renderAuth(app, { needsSetup: auth.needs_setup, setupAllowed: auth.setup_allowed !== false, onDone: boot });
     return;
   }
   route();

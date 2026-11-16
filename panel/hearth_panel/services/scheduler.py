@@ -77,7 +77,10 @@ class Cron:
         if len(parts) != 5:
             raise CronError("Use 5 fields: minute hour day-of-month month day-of-week (e.g. 0 4 * * *)")
         fields = [_field(p, *spec) for p, spec in zip(parts, FIELDS)]
-        return cls(*fields, day_restricted=parts[2] != "*", weekday_restricted=parts[4] != "*")
+        # Standard cron: a day field starting with "*" (including "*/2") counts as unrestricted,
+        # so day-of-month and day-of-week are only OR-ed when both are really restricted.
+        return cls(*fields, day_restricted=not parts[2].startswith("*"),
+                   weekday_restricted=not parts[4].startswith("*"))
 
     def _day_matches(self, dt: datetime) -> bool:
         dom = dt.day in self.days
@@ -174,7 +177,10 @@ class Scheduler:
             server: Server = schedule.server
             try:
                 result = await self._act(db, schedule, server)
-            except (NodeError, BackupFailed) as exc:
+            except Exception as exc:  # a schedule that fails must say so, whatever went wrong
+                if not isinstance(exc, (NodeError, BackupFailed)):
+                    log.exception("schedule %s failed", schedule.name)
+                db.rollback()
                 result = f"Failed: {exc}"
                 events.emit(self.ctx, db, "schedule.failed", server=server, detail=f"{schedule.name}: {exc}")
             schedule.last_result = result[:500]
@@ -200,6 +206,10 @@ class Scheduler:
                 return f"Skipped: the server is {state.replace('_', ' ') if state else 'not running'}."
         if schedule.action in ("restart", "stop") and schedule.warn_minutes and server.template == "minecraft-java":
             await self._warn(server, schedule.action, schedule.warn_minutes)
+            # Someone may have stopped it during the countdown; a restart must not bring it back.
+            state = (await live_statuses(self.ctx, [server]))[server.uuid].get("state")
+            if state not in ("running", "starting"):
+                return f"Skipped: the server was stopped during the countdown ({state or 'not running'})."
         await nodes.power(server.node, server.uuid, schedule.action)
         return {"restart": "Restarted.", "start": "Started.", "stop": "Stopped."}[schedule.action]
 

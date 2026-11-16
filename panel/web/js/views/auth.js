@@ -2,7 +2,7 @@ import { post } from "../api.js";
 import { h } from "../dom.js";
 import { busy, field, wordmark } from "../ui.js";
 
-export function renderAuth(root, { needsSetup, onDone }) {
+export function renderAuth(root, { needsSetup, setupAllowed = true, onDone }) {
   const username = h("input", { name: "username", autocomplete: "username", required: true, minlength: 3, maxlength: 32,
     pattern: "[A-Za-z0-9_.\\-]+", spellcheck: "false", autocapitalize: "none" });
   const password = h("input", { name: "password", type: "password", required: true,
@@ -14,6 +14,12 @@ export function renderAuth(root, { needsSetup, onDone }) {
   const error = h("p", { class: "error", role: "alert", style: { color: "var(--bad)", fontSize: "13px" } });
   const submit = h("button", { class: "btn primary", type: "submit" }, needsSetup ? "Create admin account" : "Sign in");
 
+  if (needsSetup && !setupAllowed) {
+    // The panel only accepts the first admin account from this machine or the local network.
+    error.textContent = "Create the admin account from the computer running Hearth (http://localhost:8000) " +
+      "or from your local network. To allow it from anywhere, set HEARTH_ALLOW_REMOTE_SETUP=true and restart.";
+    submit.disabled = true;
+  }
   const form = h("form", { novalidate: false },
     field("Username", username),
     field("Password", password, { hint: needsSetup ? "At least 10 characters." : null }),

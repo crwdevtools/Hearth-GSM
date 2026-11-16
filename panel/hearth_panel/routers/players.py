@@ -48,7 +48,7 @@ async def _json_list(context, server: Server, filename: str) -> list[dict]:
     try:
         raw = await context.nodes.read_file(server.node, server.uuid, f"/{filename}")
         data = json.loads(raw or "[]")
-        return data if isinstance(data, list) else []
+        return [p for p in data if isinstance(p, dict)] if isinstance(data, list) else []
     except (NodeError, ValueError):
         return []
 

@@ -1,13 +1,39 @@
-"""Sandboxed file access inside one server's data directory."""
+"""Sandboxed file access inside one server's data directory.
+
+The server folder is shared with the game container, and whatever runs there (a mod, a plugin)
+can create, replace and swap files in it at any moment. The agent runs as root, so a check made
+on a path and an action taken later on the same path can be raced: swap a folder for a symlink
+in between and the action lands anywhere on the host. Everything here therefore walks paths one
+component at a time with O_NOFOLLOW, and acts through the resulting directory file descriptors
+(dir_fd=...), never through a path string that the container could change underneath us.
+"""
 
 from __future__ import annotations
 
+import errno
+import hashlib
 import os
 import shutil
+import stat
+import tarfile
+import tempfile
+import time
+import urllib.parse
+import urllib.request
+import zipfile
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 MAX_READ_BYTES = 2 * 1024 * 1024
+MAX_FETCH_BYTES = 1024 * 1024 * 1024
+FREE_SPACE_MARGIN = 256 * 1024 * 1024  # never fill a node's disk to the last byte
+FETCH_HOSTS = {"cdn.modrinth.com", "edge.forgecdn.net", "mediafilez.forgecdn.net"}
+
+_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
+_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | _CLOEXEC
+# O_NONBLOCK: opening a FIFO someone planted must not hang the agent; regular files ignore it.
+_READ_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | _CLOEXEC
 
 
 class FileAccessError(Exception):
@@ -16,127 +42,338 @@ class FileAccessError(Exception):
         self.status = status
 
 
-def resolve(root: Path, relative: str) -> Path:
-    """Resolve `relative` under `root`, refusing anything that escapes it (incl. via symlinks)."""
-    root = root.resolve()
-    candidate = (root / relative.lstrip("/")).resolve()
-    if candidate != root and root not in candidate.parents:
-        raise FileAccessError("Path is outside the server directory.", 403)
-    return candidate
+OUTSIDE = "Path is outside the server directory."
 
 
-def resolve_entry(root: Path, relative: str) -> Path:
-    """Like resolve(), but does not follow a symlink in the final component, so deleting or
-    renaming a link acts on the link itself rather than on what it points to."""
-    parts = [p for p in relative.split("/") if p]
-    if not parts or parts[-1] in (".", ".."):
-        raise FileAccessError("Refusing to act on the server root.", 403)
-    parent = resolve(root, "/".join(parts[:-1]))
-    return parent / parts[-1]
+# ----- walking without following links --------------------------------------------------------
+
+
+def split(relative: str) -> list[str]:
+    """Path components of a request path, refusing anything that could climb out."""
+    if "\x00" in relative:
+        raise FileAccessError("Invalid path.", 400)
+    parts = [p for p in relative.replace("\\", "/").split("/") if p not in ("", ".")]
+    if ".." in parts:
+        raise FileAccessError(OUTSIDE, 403)
+    return parts
+
+
+def open_dir(root: Path, parts: list[str], *, create: bool = False) -> int:
+    """A directory fd for root/parts, refusing any symlink on the way. Caller closes it."""
+    fd = os.open(root, _DIR_FLAGS)
+    try:
+        for name in parts:
+            nfd = child_dir(fd, name, create=create)
+            os.close(fd)
+            fd = nfd
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def child_dir(parent_fd: int, name: str, *, create: bool = False) -> int:
+    """Open (or create) one folder inside an open folder, refusing a symlink. Caller closes it."""
+    try:
+        return os.open(name, _DIR_FLAGS, dir_fd=parent_fd)
+    except FileNotFoundError:
+        if not create:
+            raise FileAccessError("Directory not found.", 404) from None
+    except OSError as exc:
+        raise _step_error(exc, parent_fd, name) from None
+    try:
+        os.mkdir(name, 0o755, dir_fd=parent_fd)
+    except FileExistsError:
+        pass  # created meanwhile; the open below checks what it is
+    try:
+        return os.open(name, _DIR_FLAGS, dir_fd=parent_fd)
+    except OSError as exc:
+        raise _step_error(exc, parent_fd, name) from None
+
+
+def _step_error(exc: OSError, parent_fd: int, name: str) -> FileAccessError:
+    # With O_NOFOLLOW|O_DIRECTORY, Linux reports a symlink as ELOOP or ENOTDIR depending on the
+    # kernel; either way a link where a folder was expected means "outside".
+    st = _lstat(name, parent_fd)
+    if exc.errno == errno.ELOOP or (st is not None and stat.S_ISLNK(st.st_mode)):
+        return FileAccessError(OUTSIDE, 403)
+    if exc.errno == errno.ENOTDIR:
+        return FileAccessError("Directory not found.", 404)
+    return FileAccessError(f"Can't open that folder: {exc.strerror}.", 400)
+
+
+class Dir:
+    """`with Dir(root, parts) as fd:` closes the fd however the block ends."""
+
+    def __init__(self, root: Path, parts: list[str], *, create: bool = False) -> None:
+        self.fd = open_dir(root, parts, create=create)
+
+    def __enter__(self) -> int:
+        return self.fd
+
+    def __exit__(self, *exc: Any) -> None:
+        os.close(self.fd)
+
+
+def _lstat(name: str, dir_fd: int) -> os.stat_result | None:
+    try:
+        return os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+
+
+def _open_regular(name: str, dir_fd: int) -> int:
+    """Open a regular file for reading without following a link; anything else is 'not found'."""
+    try:
+        fd = os.open(name, _READ_FLAGS, dir_fd=dir_fd)
+    except FileNotFoundError:
+        raise FileAccessError("File not found.", 404) from None
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise FileAccessError(OUTSIDE, 403) from None
+        raise FileAccessError("File not found.", 404) from None
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise FileAccessError("File not found.", 404)
+    return fd
+
+
+def _remove(name: str, dir_fd: int) -> None:
+    st = _lstat(name, dir_fd)
+    if st is None:
+        return
+    if stat.S_ISDIR(st.st_mode):
+        shutil.rmtree(name, dir_fd=dir_fd)  # fd-based on Linux: doesn't follow links inside
+    else:
+        os.unlink(name, dir_fd=dir_fd)
+
+
+def free_space(dir_fd: int) -> int:
+    st = os.fstatvfs(dir_fd)
+    return st.f_bavail * st.f_frsize
+
+
+# ----- the operations the panel calls ---------------------------------------------------------
 
 
 def list_dir(root: Path, relative: str) -> list[dict[str, Any]]:
-    path = resolve(root, relative)
-    if not path.is_dir():
-        raise FileAccessError("Directory not found.", 404)
-    entries = []
-    with os.scandir(path) as it:
-        for entry in it:
-            try:
-                st = entry.stat(follow_symlinks=False)
-            except OSError:
-                continue
-            entries.append(
-                {
+    with Dir(root, split(relative)) as fd:
+        entries = []
+        with os.scandir(fd) as it:
+            for entry in it:
+                try:
+                    st = entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                entries.append({
                     "name": entry.name,
-                    "is_dir": entry.is_dir(follow_symlinks=False),
-                    "is_symlink": entry.is_symlink(),
+                    "is_dir": stat.S_ISDIR(st.st_mode),
+                    "is_symlink": stat.S_ISLNK(st.st_mode),
                     "size": st.st_size,
                     "modified": int(st.st_mtime),
-                }
-            )
-    entries.sort(key=lambda e: (not e["is_dir"], e["name"].lower()))
+                })
+    entries.sort(key=lambda e: (not e["is_dir"], str(e["name"]).lower()))
     return entries
 
 
 def read_text(root: Path, relative: str) -> str:
-    path = resolve(root, relative)
-    if not path.is_file():
+    parts = split(relative)
+    if not parts:
         raise FileAccessError("File not found.", 404)
-    if path.stat().st_size > MAX_READ_BYTES:
-        raise FileAccessError("File is larger than 2 MB; download it over SFTP instead.", 413)
-    data = path.read_bytes()
+    with Dir(root, parts[:-1]) as d:
+        fd = _open_regular(parts[-1], d)
+    with os.fdopen(fd, "rb") as f:
+        if os.fstat(f.fileno()).st_size > MAX_READ_BYTES:
+            raise FileAccessError("File is larger than 2 MB; download it instead.", 413)
+        data = f.read(MAX_READ_BYTES + 1)
     if b"\x00" in data[:8192]:
         raise FileAccessError("This looks like a binary file and can't be edited here.", 415)
     return data.decode("utf-8", "replace")
 
 
+def open_read(root: Path, relative: str) -> tuple[BinaryIO, int, str]:
+    """(file, size, name) for a download. The caller closes the file."""
+    parts = split(relative)
+    if not parts:
+        raise FileAccessError("File not found.", 404)
+    with Dir(root, parts[:-1]) as d:
+        fd = _open_regular(parts[-1], d)
+    f = os.fdopen(fd, "rb")
+    return f, os.fstat(fd).st_size, parts[-1]
+
+
+class PendingWrite:
+    """A file being written next to its final name, then swapped in atomically by commit().
+    Holds the parent folder open the whole time, so the folder can't be swapped for a link."""
+
+    def __init__(self, root: Path, relative: str, *, margin: int = FREE_SPACE_MARGIN) -> None:
+        self.margin = margin
+        parts = split(relative)
+        if not parts:
+            raise FileAccessError("Cannot overwrite a directory.", 400)
+        self.name = parts[-1]
+        self.tmp = f".{self.name}.hearth-tmp"
+        self.dir_fd = open_dir(root, parts[:-1], create=True)
+        try:
+            existing = _lstat(self.name, self.dir_fd)
+            if existing is not None and stat.S_ISDIR(existing.st_mode):
+                raise FileAccessError("A folder with that name already exists.", 409)
+            _remove(self.tmp, self.dir_fd)
+            fd = os.open(self.tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | _CLOEXEC, 0o644,
+                         dir_fd=self.dir_fd)
+            self.file: BinaryIO = os.fdopen(fd, "wb")
+            self.free = free_space(self.dir_fd)
+        except BaseException:
+            os.close(self.dir_fd)
+            raise
+        self.written = 0
+        self._done = False
+
+    def write(self, chunk: bytes) -> None:
+        self.written += len(chunk)
+        if self.written > self.free - self.margin:
+            raise FileAccessError("Not enough free disk space on the node for this file.", 507)
+        self.file.write(chunk)
+
+    def commit(self) -> None:
+        self.file.close()
+        try:
+            os.replace(self.tmp, self.name, src_dir_fd=self.dir_fd, dst_dir_fd=self.dir_fd)
+        except OSError as exc:  # e.g. a folder appeared under that name meanwhile
+            raise FileAccessError(f"Couldn't save {self.name}: {exc.strerror}.", 409) from None
+        self._finish()
+
+    def abort(self) -> None:
+        if self._done:
+            return
+        try:
+            self.file.close()
+            os.unlink(self.tmp, dir_fd=self.dir_fd)
+        except OSError:
+            pass
+        self._finish()
+
+    def _finish(self) -> None:
+        if not self._done:
+            self._done = True
+            os.close(self.dir_fd)
+
+
+def open_upload(root: Path, relative: str) -> PendingWrite:
+    return PendingWrite(root, relative)
+
+
 def write_text(root: Path, relative: str, content: str) -> None:
-    path = resolve(root, relative)
-    if path == root.resolve() or path.is_dir():
-        raise FileAccessError("Cannot overwrite a directory.")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.hearth-tmp")
-    tmp.write_text(content, encoding="utf-8")
-    tmp.replace(path)
+    # No safety margin for small edits: fixing a config on a nearly full disk must still work.
+    pending = PendingWrite(root, relative, margin=0)
+    try:
+        pending.write(content.encode("utf-8"))
+        pending.commit()
+    except BaseException:
+        pending.abort()
+        raise
 
 
 def make_dir(root: Path, relative: str) -> None:
-    resolve(root, relative).mkdir(parents=True, exist_ok=True)
+    os.close(open_dir(root, split(relative), create=True))
 
 
 def delete(root: Path, relative: str) -> None:
-    path = resolve_entry(root, relative)
-    if path.is_symlink() or path.is_file():
-        path.unlink()
-    elif path.is_dir():
-        shutil.rmtree(path)
-    else:
-        raise FileAccessError("Not found.", 404)
+    parts = split(relative)
+    if not parts:
+        raise FileAccessError("Refusing to act on the server root.", 403)
+    with Dir(root, parts[:-1]) as d:
+        if _lstat(parts[-1], d) is None:
+            raise FileAccessError("Not found.", 404)
+        _remove(parts[-1], d)  # a link is removed itself, never what it points to
 
 
 def rename(root: Path, source: str, target: str) -> None:
-    src, dst = resolve_entry(root, source), resolve_entry(root, target)
-    if not src.exists() and not src.is_symlink():
-        raise FileAccessError("Not found.", 404)
-    if dst.exists():
-        raise FileAccessError("A file with that name already exists.", 409)
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    src.rename(dst)
+    src, dst = split(source), split(target)
+    if not src or not dst:
+        raise FileAccessError("Refusing to act on the server root.", 403)
+    with Dir(root, src[:-1]) as sd, Dir(root, dst[:-1], create=True) as dd:
+        if _lstat(src[-1], sd) is None:
+            raise FileAccessError("Not found.", 404)
+        if _lstat(dst[-1], dd) is not None:
+            raise FileAccessError("A file with that name already exists.", 409)
+        try:
+            os.rename(src[-1], dst[-1], src_dir_fd=sd, dst_dir_fd=dd)
+        except OSError as exc:
+            raise FileAccessError(f"Couldn't rename: {exc.strerror}.", 400) from None
 
 
-# ----- uploads, archives, downloads -----------------------------------------------------------
-
-import hashlib  # noqa: E402
-import tarfile  # noqa: E402
-import tempfile  # noqa: E402
-import urllib.parse  # noqa: E402
-import urllib.request  # noqa: E402
-import zipfile  # noqa: E402
-
-MAX_FETCH_BYTES = 1024 * 1024 * 1024
-FETCH_HOSTS = {"cdn.modrinth.com", "edge.forgecdn.net", "mediafilez.forgecdn.net"}
+# ----- walking a whole tree -------------------------------------------------------------------
 
 
-def open_upload(root: Path, relative: str) -> tuple[Path, Path]:
-    """Validate an upload target; returns (final path, temp path to stream into)."""
-    path = resolve_entry(root, relative)
-    if path.is_dir():
-        raise FileAccessError("A folder with that name already exists.", 409)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    return path, path.with_name(f".{path.name}.hearth-tmp")
+def walk(dir_fd: int) -> Iterator[tuple[str, list[str], list[str], int]]:
+    """os.fwalk below an open folder: (relative dir, dir names, other names, dir fd). fwalk never
+    follows links and acts on fds, so a swap mid-walk can't lead it outside the folder."""
+    for dirpath, dirnames, filenames, fd in os.fwalk(".", dir_fd=dir_fd, follow_symlinks=False):
+        rel = os.path.normpath(dirpath)
+        # fwalk lists links to folders among the folders (it just doesn't enter them); report
+        # them with the other non-folders so callers treat them as links.
+        links = [d for d in dirnames if (st := _lstat(d, fd)) is None or stat.S_ISLNK(st.st_mode)]
+        for d in links:
+            dirnames.remove(d)
+        yield ("" if rel == "." else rel), dirnames, filenames + links, fd
+
+
+def _join(base: str, name: str) -> str:
+    return f"{base}/{name}" if base else name
 
 
 def archive_folder(root: Path, relative: str, out: Path) -> Path:
-    """Zip a folder (e.g. the world) for download."""
-    source = resolve(root, relative)
-    if not source.is_dir():
-        raise FileAccessError("Folder not found.", 404)
-    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
-        for path in sorted(source.rglob("*")):
-            if path.is_file() and not path.is_symlink():
-                zf.write(path, Path(source.name) / path.relative_to(source))
+    """Zip a folder (e.g. the world) for download. Links and special files are left out."""
+    parts = split(relative)
+    top = parts[-1] if parts else (root.name or "server")
+    with Dir(root, parts) as d, zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+        for rel, _dirs, names, fd in walk(d):
+            for name in sorted(names):
+                try:
+                    file_fd = _open_regular(name, fd)
+                except FileAccessError:
+                    continue  # a link, socket, FIFO, or gone
+                with os.fdopen(file_fd, "rb") as src:
+                    mtime = time.localtime(max(os.fstat(file_fd).st_mtime, 315532800))  # zip can't go before 1980
+                    info = zipfile.ZipInfo(f"{top}/{_join(rel, name)}", date_time=mtime[:6])
+                    info.compress_type = zipfile.ZIP_DEFLATED
+                    with zf.open(info, "w", force_zip64=True) as dst:
+                        shutil.copyfileobj(src, dst, 1 << 20)
     return out
+
+
+def copy_tree(source_root: Path, dest: Path) -> None:
+    """Copy one server's folder into another's (cloning). The source may be live, so it is read
+    through fds; the destination belongs to a stopped server only the agent touches."""
+    dest.mkdir(parents=True, exist_ok=True)
+    with Dir(source_root, []) as d:
+        for rel, dirs, names, fd in walk(d):
+            target_dir = dest / rel if rel else dest
+            for name in dirs:
+                (target_dir / name).mkdir(exist_ok=True)
+            for name in names:
+                st = _lstat(name, fd)
+                if st is None:
+                    continue
+                target = target_dir / name
+                if stat.S_ISLNK(st.st_mode):
+                    link = os.readlink(name, dir_fd=fd)
+                    if target.is_symlink() or target.exists():
+                        target.unlink()
+                    os.symlink(link, target)  # copied as a link; never followed by the agent
+                    continue
+                try:
+                    file_fd = _open_regular(name, fd)
+                except FileAccessError:
+                    continue
+                out_fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | _CLOEXEC, 0o644)
+                with os.fdopen(file_fd, "rb") as src, os.fdopen(out_fd, "wb") as out:
+                    shutil.copyfileobj(src, out, 1 << 20)
+                os.utime(target, (st.st_atime, st.st_mtime))
+
+
+# ----- importing archives ---------------------------------------------------------------------
 
 
 def _safe_zip_extract(zf: zipfile.ZipFile, dest: Path) -> None:
@@ -163,87 +400,122 @@ def _find_world(folder: Path) -> Path | None:
     return hits[0] if hits else None
 
 
-def _check_size(entries: list[tuple[str, int]], dest: Path) -> None:
-    total = sum(size for _, size in entries)
-    free = shutil.disk_usage(dest).free
-    if total > free - 256 * 1024 * 1024:
+def _check_size(entries: list[int], free: int) -> None:
+    total = sum(entries)
+    if total > free - FREE_SPACE_MARGIN:
         raise FileAccessError(f"Unpacked, this archive needs {total // 1048576} MB; the node has "
                               f"{free // 1048576} MB free.", 507)
 
 
-def _move_into(source: Path, target: Path) -> None:
-    target.mkdir(parents=True, exist_ok=True)
+def _move_into(source: Path, dest_fd: int) -> None:
+    """Move everything in `source` (private to the agent) into an open folder, replacing
+    same-named entries."""
     for item in source.iterdir():
-        dest = target / item.name
-        if dest.exists() or dest.is_symlink():
-            shutil.rmtree(dest) if dest.is_dir() and not dest.is_symlink() else dest.unlink()
-        shutil.move(str(item), dest)
+        _remove(item.name, dest_fd)
+        try:
+            os.rename(item, item.name, dst_dir_fd=dest_fd)
+        except OSError as exc:
+            raise FileAccessError(f"Couldn't move {item.name} into place: {exc.strerror}.", 400) from None
 
 
-def extract_archive(root: Path, archive_rel: str, target_rel: str, *, replace: bool, world: bool) -> str:
-    archive = resolve(root, archive_rel)
-    if not archive.is_file():
+def extract_archive(root: Path, archive_rel: str, target_rel: str, *, replace: bool, world: bool,
+                    staging_root: Path) -> str:
+    """Unpack an uploaded archive into the server folder. It is first unpacked into
+    `staging_root`, which the game container can't see (so nothing can be planted mid-extract),
+    then moved into place through folder fds."""
+    archive_parts, target_parts = split(archive_rel), split(target_rel)
+    if not archive_parts:
         raise FileAccessError("Archive not found.", 404)
-    target = resolve(root, target_rel)
-    if target == root.resolve() and replace:
+    if not target_parts and replace:
         raise FileAccessError("Refusing to replace the whole server folder.", 403)
-    with tempfile.TemporaryDirectory(dir=root, prefix=".hearth-extract-") as tmp:
+    name = archive_parts[-1].lower()
+    if not name.endswith((".zip", ".tar.gz", ".tgz", ".tar")):
+        raise FileAccessError("Upload a .zip, .tar.gz or .tgz file.", 415)
+    staging_root.mkdir(parents=True, exist_ok=True)
+    with Dir(root, archive_parts[:-1]) as archive_dir, \
+            tempfile.TemporaryDirectory(dir=staging_root, prefix="extract-") as tmp:
         staging = Path(tmp)
-        name = archive.name.lower()
-        if name.endswith(".zip"):
-            with zipfile.ZipFile(archive) as zf:
-                _check_size([(i.filename, i.file_size) for i in zf.infolist()], root)  # zip bombs
-                _safe_zip_extract(zf, staging)
-        elif name.endswith((".tar.gz", ".tgz", ".tar")):
-            with tarfile.open(archive) as tar:
-                _check_size([(m.name, m.size) for m in tar.getmembers()], root)
-                tar.extractall(staging, filter="data")
-        else:
-            raise FileAccessError("Upload a .zip, .tar.gz or .tgz file.", 415)
+        free = free_space(archive_dir)
+        with os.fdopen(_open_regular(archive_parts[-1], archive_dir), "rb") as archive:
+            if name.endswith(".zip"):
+                with zipfile.ZipFile(archive) as zf:
+                    _check_size([i.file_size for i in zf.infolist()], free)  # zip bombs
+                    _safe_zip_extract(zf, staging)
+            else:
+                with tarfile.open(fileobj=archive) as tar:
+                    _check_size([m.size for m in tar.getmembers()], free)
+                    tar.extractall(staging, filter="data")
         if not world:
-            if replace and target.exists():
-                shutil.rmtree(target)
-            _move_into(staging, target)
+            with Dir(root, target_parts, create=True) as dest:
+                if replace:  # empty it first; the folder itself stays (it might be a mount)
+                    for entry in os.listdir(dest):
+                        _remove(entry, dest)
+                _move_into(staging, dest)
         else:
             source = _find_world(staging)
             if source is None:
                 raise FileAccessError("No Minecraft world in that archive (couldn't find level.dat).", 400)
             # Replace the overworld and its Paper dimension folders together; leftovers from the
             # old world would otherwise reappear as its nether and end.
-            pairs = [(source, target)] + [
-                (source.with_name(source.name + suffix), target.with_name(target.name + suffix))
-                for suffix in DIMENSION_SUFFIXES]
-            for src, dst in pairs:
-                if replace and dst.exists() and dst != root.resolve():
-                    shutil.rmtree(dst)
-                if src.is_dir():
-                    _move_into(src, dst)
-    archive.unlink(missing_ok=True)
-    return str(target.relative_to(root.resolve()))
+            with Dir(root, target_parts[:-1], create=True) as parent:
+                world_name = target_parts[-1]
+                for suffix in ("",) + DIMENSION_SUFFIXES:
+                    src = source.with_name(source.name + suffix)
+                    if replace:
+                        _remove(world_name + suffix, parent)
+                    if src.is_dir():
+                        dst = child_dir(parent, world_name + suffix, create=True)
+                        try:
+                            _move_into(src, dst)
+                        finally:
+                            os.close(dst)
+        os.unlink(archive_parts[-1], dir_fd=archive_dir)
+    return "/".join(target_parts)
+
+
+
+
+# ----- mod downloads ----------------------------------------------------------------------------
+
+
+def _check_fetch_url(url: str) -> None:
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != "https" or parsed.hostname not in FETCH_HOSTS:
+        raise FileAccessError("Downloads are only allowed from Modrinth and CurseForge.", 400)
+
+
+class _AllowlistRedirects(urllib.request.HTTPRedirectHandler):
+    """Follow a CDN's redirects only while they stay on the allowed hosts, so a redirect can't
+    send the agent somewhere inside its own network."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _check_fetch_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_opener = urllib.request.build_opener(_AllowlistRedirects)
 
 
 def fetch(root: Path, url: str, relative: str, sha512: str | None) -> int:
     """Download a mod/plugin from Modrinth or CurseForge's CDN into the server folder."""
-    parsed = urllib.parse.urlsplit(url)
-    if parsed.scheme != "https" or parsed.hostname not in FETCH_HOSTS:
-        raise FileAccessError("Downloads are only allowed from Modrinth and CurseForge.", 400)
-    path, tmp = open_upload(root, relative)
+    _check_fetch_url(url)
+    pending = PendingWrite(root, relative)
     digest = hashlib.sha512()
-    size = 0
     req = urllib.request.Request(url, headers={"User-Agent": "hearth-agent"})
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp, open(tmp, "wb") as out:  # noqa: S310 (host allowlisted)
+        with _opener.open(req, timeout=60) as resp:  # noqa: S310 (host allowlisted, per redirect too)
             while chunk := resp.read(1 << 16):
-                size += len(chunk)
-                if size > MAX_FETCH_BYTES:
+                if pending.written + len(chunk) > MAX_FETCH_BYTES:
                     raise FileAccessError("Download is larger than 1 GB.", 413)
                 digest.update(chunk)
-                out.write(chunk)
+                pending.write(chunk)
         if sha512 and digest.hexdigest() != sha512:
             raise FileAccessError("Downloaded file doesn't match its checksum; not installed.", 502)
-        tmp.replace(path)
+        pending.commit()
     except OSError as exc:
+        pending.abort()
         raise FileAccessError(f"Download failed: {exc}", 502) from exc
-    finally:
-        tmp.unlink(missing_ok=True)
-    return size
+    except BaseException:
+        pending.abort()
+        raise
+    return pending.written

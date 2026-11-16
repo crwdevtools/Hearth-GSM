@@ -95,10 +95,13 @@ if [[ ! -f .env ]]; then
   [[ "$host" =~ ^[A-Za-z0-9.:-]+$ ]] || die "\"$host\" doesn't look like a hostname or IP address."
 
 
-  sed -e "s|^HEARTH_AGENT_TOKEN=.*|HEARTH_AGENT_TOKEN=$(random_token)|" \
+  token="$(random_token)"
+  # umask in a subshell: .env (which holds the agent token) is never readable by others, not even
+  # for the moment between creating it and a chmod.
+  (umask 077 && sed -e "s|^HEARTH_AGENT_TOKEN=.*|HEARTH_AGENT_TOKEN=$token|" \
       -e "s|^HEARTH_PUBLIC_HOST=.*|HEARTH_PUBLIC_HOST=$host|" \
       -e "s|^HEARTH_DATA_DIR=.*|HEARTH_DATA_DIR=$data_dir|" \
-      .env.example > .env
+      .env.example > .env)
   chmod 600 .env
   say "Saved settings to .env (edit it later to change them)."
 fi
@@ -108,7 +111,11 @@ port="${port:-8000}"
 
 # ----- Start ---------------------------------------------------------------------------------------
 say "Building and starting Hearth (the first run takes a few minutes)…"
-docker compose up -d --build || die "Starting the containers failed. The messages above say why."
+# --pull fetches the latest Python base image, so its security fixes reach the panel and agent.
+# Offline, fall back to the copy already on this machine.
+docker compose build --pull || { say "Couldn't check for a newer base image; using the one on this machine."; docker compose build; } \
+  || die "Building Hearth failed. The messages above say why."
+docker compose up -d || die "Starting the containers failed. The messages above say why."
 
 say "Waiting for the panel…"
 up() {

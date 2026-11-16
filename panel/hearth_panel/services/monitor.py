@@ -29,6 +29,7 @@ class Seen:
     empty_since: float | None = None
     last_player_check: float = 0.0
     players: list[str] = field(default_factory=list)
+    quiet_stop: bool = False  # the monitor stopped it and already announced why
 
 
 class Monitor:
@@ -63,7 +64,8 @@ class Monitor:
         self.seen[server.id] = cur = Seen(state, restarts, ooms,
                                           prev.empty_since if prev else None,
                                           prev.last_player_check if prev else 0.0,
-                                          prev.players if prev else [])
+                                          prev.players if prev else [],
+                                          prev.quiet_stop if prev else False)
         if prev is None:
             return  # first sight after a panel restart: no history to compare
 
@@ -77,7 +79,9 @@ class Monitor:
         elif state == "running" and prev.state in ("starting", "offline", "installing", "restoring"):
             emit("server.started")
         elif state == "offline" and prev.state in ("running", "stopping", "starting") and ooms == prev.oom_kills:
-            emit("server.stopped")
+            if not prev.quiet_stop:
+                emit("server.stopped")
+            cur.quiet_stop = False
         elif state == "sleeping" and prev.state != "sleeping":
             emit("server.sleeping", "Nobody was online. It wakes up when someone joins.")
 
@@ -109,9 +113,11 @@ class Monitor:
             return
         cur.empty_since = None
         if server.wake_on_join:
-            await self._safe(server, lambda: self.ctx.nodes.sleep(server.node, server.uuid))
+            motd = str((server.variables or {}).get("MOTD") or "").strip() or "Sleeping - join to wake me up"
+            await self._safe(server, lambda: self.ctx.nodes.sleep(server.node, server.uuid, motd))
         else:
             await self._safe(server, lambda: self.ctx.nodes.power(server.node, server.uuid, "stop"))
+            cur.quiet_stop = True  # the running → offline change that follows is this stop
             events.emit(self.ctx, db, "server.stopped",
                         server=server, detail=f"Nobody was online for {server.auto_stop_minutes} minutes.")
 

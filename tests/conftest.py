@@ -27,7 +27,7 @@ class FakeAgent:
         self.fetched: list[dict] = []
         self.files: dict[str, str] = {}
         self.copies: list[tuple[str, str]] = []
-        self.slept: list[str] = []
+        self.slept: list[tuple[str, str | None]] = []
         self.command_output = "ok"
         self.fail_backups = False
         self.online = True
@@ -89,7 +89,7 @@ class FakeAgent:
         if tail == "metrics":
             return httpx.Response(200, json={"minutes": [{"t": 0, "cpu": 5.0, "mem": 1}], "recent": []})
         if tail == "sleep":
-            self.slept.append(uuid)
+            self.slept.append((uuid, json.loads(request.content or b"{}").get("motd")))
             return httpx.Response(202, json={"accepted": True})
         if tail == "power":
             self.power.append((uuid, json.loads(request.content)["action"]))
@@ -118,11 +118,33 @@ class FakePublic:
         self.versions = list(MODRINTH_VERSIONS)
         self.posts: list[tuple[str, dict]] = []
         self.reachable = True
+        self.redirect_posts_to: str | None = None  # answer webhook POSTs with a redirect
+        self.breached = {"password1234": 2_000_000}  # passwords the fake breach service knows
+        self.pwned_down = False
+        self.pwned_prefixes: list[str] = []  # what was sent to it
+
+    def _pwned(self, request: httpx.Request) -> httpx.Response:
+        import hashlib
+
+        if self.pwned_down:
+            return httpx.Response(503)
+        prefix = request.url.path.rsplit("/", 1)[-1]
+        self.pwned_prefixes.append(prefix)
+        lines = ["0" * 35 + ":0"]  # padding, like the real service
+        for password, count in self.breached.items():
+            digest = hashlib.sha1(password.encode()).hexdigest().upper()
+            if digest.startswith(prefix):
+                lines.append(f"{digest[5:]}:{count}")
+        return httpx.Response(200, text="\r\n".join(lines))
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
+        if request.url.host == "api.pwnedpasswords.com":
+            return self._pwned(request)
         url = str(request.url)
         if request.method == "POST":  # Discord + outgoing webhooks
             self.posts.append((url, json.loads(request.content or b"{}")))
+            if self.redirect_posts_to:
+                return httpx.Response(307, headers={"Location": self.redirect_posts_to})
             return httpx.Response(204)
         if "api.mcsrvstat.us" in url:
             return httpx.Response(200, json={"online": self.reachable, "players": {"online": 1, "max": 20}})
@@ -163,6 +185,19 @@ def agent():
     return FakeAgent()
 
 
+# No DNS in tests: names resolve to a public documentation-free address unless listed here.
+FAKE_DNS = {"inside.example.com": ["10.0.0.5"], "metadata.example.com": ["169.254.169.254"]}
+
+
+async def fake_resolver(host: str) -> list[str]:
+    import ipaddress
+
+    try:
+        return [str(ipaddress.ip_address(host))]
+    except ValueError:
+        return FAKE_DNS.get(host, ["8.8.4.4"])
+
+
 @pytest.fixture
 def public():
     return FakePublic()
@@ -182,7 +217,8 @@ def client(tmp_path, agent, public):
                            "secret_key": "test-secret-" + "x" * 32, "curseforge_api_key": None})
     context = PanelContext.build(settings, node_transport=httpx.MockTransport(agent),
                                  public_transport=httpx.MockTransport(public))
-    with TestClient(create_app(context, run_updater=False)) as c:
+    context.resolver = fake_resolver
+    with TestClient(create_app(context, run_updater=False), client=("127.0.0.1", 50000)) as c:
         yield c
 
 

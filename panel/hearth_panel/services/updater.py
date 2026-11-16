@@ -110,6 +110,9 @@ async def check_all(ctx) -> int:
             except UpstreamError as exc:
                 log.warning("update check for %s failed: %s", server.name, exc)
                 db.rollback()
+            except Exception:  # one broken server mustn't stop the check for the others
+                log.exception("update check for %s failed", server.name)
+                db.rollback()
         return checked
 
 

@@ -15,12 +15,16 @@ import jwt
 
 _SCRYPT_N, _SCRYPT_R, _SCRYPT_P = 2**15, 8, 1
 SESSION_COOKIE = "hearth_session"
+# Each scrypt run takes ~32 MB. Sign-in requests run in a thread pool, so a burst of them
+# (before any failure is counted by the throttle) could otherwise take gigabytes at once.
+_SCRYPT_SLOTS = threading.BoundedSemaphore(4)
 
 
 def hash_password(password: str) -> str:
     salt = secrets.token_bytes(16)
-    digest = hashlib.scrypt(password.encode(), salt=salt, n=_SCRYPT_N, r=_SCRYPT_R, p=_SCRYPT_P,
-                            maxmem=64 * 1024 * 1024, dklen=32)
+    with _SCRYPT_SLOTS:
+        digest = hashlib.scrypt(password.encode(), salt=salt, n=_SCRYPT_N, r=_SCRYPT_R, p=_SCRYPT_P,
+                                maxmem=64 * 1024 * 1024, dklen=32)
     return "scrypt${}${}${}${}${}".format(
         _SCRYPT_N, _SCRYPT_R, _SCRYPT_P, base64.b64encode(salt).decode(), base64.b64encode(digest).decode()
     )
@@ -32,8 +36,9 @@ def verify_password(password: str, stored: str) -> bool:
         if scheme != "scrypt":
             return False
         expected = base64.b64decode(digest_b64)
-        digest = hashlib.scrypt(password.encode(), salt=base64.b64decode(salt_b64), n=int(n), r=int(r),
-                                p=int(p), maxmem=64 * 1024 * 1024, dklen=len(expected))
+        with _SCRYPT_SLOTS:
+            digest = hashlib.scrypt(password.encode(), salt=base64.b64decode(salt_b64), n=int(n), r=int(r),
+                                    p=int(p), maxmem=64 * 1024 * 1024, dklen=len(expected))
     except (ValueError, TypeError):
         return False
     return hmac.compare_digest(digest, expected)
@@ -80,6 +85,9 @@ class LoginThrottle:
         now = time.monotonic()
         with self._lock:
             q = self._trim(key, now)
+            if not q:
+                self._fails.pop(key, None)  # don't keep an entry for every name ever tried
+                return 0.0
             if len(q) < self.limit:
                 return 0.0
             return max(self.window - (now - q[0]), 1.0)

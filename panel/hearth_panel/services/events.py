@@ -19,6 +19,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..models import AuditLog, Server, User, Webhook
+from . import netguard
 
 log = logging.getLogger("hearth.events")
 
@@ -69,7 +70,11 @@ def emit(ctx, db: Session, action: str, *, server: Server | None = None, user: U
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
-        return  # called from a worker thread without a loop; the log entry is enough
+        # Called from a worker thread (a plain `def` route): the activity log has it, but nothing
+        # can be sent from here. Routes that emit announced events must be `async def`.
+        if targets or discord:
+            log.warning("%s not delivered: emitted outside the event loop", action)
+        return
     task = loop.create_task(_deliver(ctx, payload, targets, discord))
     _background.add(task)
     task.add_done_callback(_background.discard)
@@ -80,7 +85,15 @@ async def _deliver(ctx, payload: dict[str, Any], targets: list[tuple[str, str]],
     for url, secret in targets:
         signature = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
         try:
-            await ctx.http.client.post(url, content=body, timeout=8, headers={
+            if not ctx.settings.allow_private_webhooks:
+                # A webhook must not be a way to reach the panel's own network (the node agents,
+                # the cloud metadata service): check where the name points right before sending.
+                reason = await netguard.public_destination(url, ctx.resolver)
+                if reason:
+                    log.warning("webhook %s not sent: %s (set HEARTH_ALLOW_PRIVATE_WEBHOOKS=true to allow)",
+                                url, reason)
+                    continue
+            await ctx.http.client.post(url, content=body, timeout=8, follow_redirects=False, headers={
                 "Content-Type": "application/json", "X-Hearth-Event": payload["event"],
                 "X-Hearth-Signature": f"sha256={signature}"})
         except Exception as exc:
@@ -92,7 +105,8 @@ async def _deliver(ctx, payload: dict[str, Any], targets: list[tuple[str, str]],
         if payload["detail"]:
             embed["description"] = payload["detail"][:1500]
         try:
-            await ctx.http.client.post(discord, json={"username": "Hearth", "embeds": [embed]}, timeout=8)
+            await ctx.http.client.post(discord, json={"username": "Hearth", "embeds": [embed]}, timeout=8,
+                                       follow_redirects=False)
         except Exception as exc:
             log.warning("discord webhook failed: %s", exc)
 

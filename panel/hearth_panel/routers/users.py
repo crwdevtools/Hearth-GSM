@@ -7,10 +7,12 @@ from pydantic import BaseModel, Field
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
-from ..deps import admin_user, db_session
+from ..context import PanelContext
+from ..deps import admin_user, ctx, db_session
 from ..models import ApiToken, Server, User
 from ..security import hash_password
 from ..serializers import user_out
+from ..services import pwned
 from .auth import USERNAME
 
 router = APIRouter(prefix="/api/users", tags=["users"])
@@ -44,9 +46,11 @@ def list_users(_: User = Depends(admin_user), db: Session = Depends(db_session))
 
 
 @router.post("", status_code=201)
-def create_user(body: UserCreate, _: User = Depends(admin_user), db: Session = Depends(db_session)):
+def create_user(body: UserCreate, _: User = Depends(admin_user), db: Session = Depends(db_session),
+                context: PanelContext = Depends(ctx)):
     if db.scalar(select(User).where(func.lower(User.username) == body.username.lower())):
         raise HTTPException(409, "That username is taken.")
+    pwned.reject_breached_sync(context, body.password)
     user = User(username=body.username, email=body.email, password_hash=hash_password(body.password),
                 is_admin=body.is_admin, max_servers=body.max_servers, max_memory_mb=body.max_memory_mb)
     db.add(user)
@@ -55,7 +59,8 @@ def create_user(body: UserCreate, _: User = Depends(admin_user), db: Session = D
 
 
 @router.patch("/{user_id}")
-def update_user(user_id: int, body: UserPatch, admin: User = Depends(admin_user), db: Session = Depends(db_session)):
+def update_user(user_id: int, body: UserPatch, admin: User = Depends(admin_user), db: Session = Depends(db_session),
+                context: PanelContext = Depends(ctx)):
     user = db.get(User, user_id)
     if user is None:
         raise HTTPException(404, "User not found.")
@@ -65,6 +70,7 @@ def update_user(user_id: int, body: UserPatch, admin: User = Depends(admin_user)
         user.email = body.email or None
     revoke = False
     if body.password:
+        pwned.reject_breached_sync(context, body.password)
         user.password_hash = hash_password(body.password)
         user.session_version += 1
         revoke = True

@@ -9,16 +9,17 @@ import hmac
 import json
 import logging
 import time
+import urllib.parse
 from contextlib import asynccontextmanager
 from typing import Any, Callable
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, WebSocket
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask
 
 from . import VERSION, files
 from .config import AgentConfig
-from .backups import BackupStore, free_bytes
+from .backups import BackupStore
 from .models import (BackupRequest, Command, ExtractRequest, FetchRequest, FileWrite, PathBody, PowerAction,
                      RenameBody, ServerSpec, SleepRequest, TunnelRequest, UUID_RE)
 from .runtime import RuntimeFailure, ServerManager, ServerNotFound
@@ -193,17 +194,22 @@ def create_app(config: AgentConfig | None = None, docker_factory: Callable[[], A
 
     @app.put("/api/servers/{uuid}/files/upload", status_code=204, dependencies=auth)
     async def upload(uuid: str, request: Request, path: str = Query(..., max_length=1024)) -> None:
-        target, tmp = files.open_upload(writable_root(uuid), path)
-        need = int(request.headers.get("content-length") or 0)
-        if need and need > free_bytes(target.parent) - 256 * 1024 * 1024:
-            raise HTTPException(507, "Not enough free disk space on the node for this upload.")
+        pending = await asyncio.to_thread(files.open_upload, writable_root(uuid), path)
         try:
-            with open(tmp, "wb") as out:
-                async for chunk in request.stream():
-                    await asyncio.to_thread(out.write, chunk)
-            tmp.replace(target)
+            need = int(request.headers.get("content-length") or 0)
+            if need and need > pending.free - files.FREE_SPACE_MARGIN:
+                raise HTTPException(507, "Not enough free disk space on the node for this upload.")
+            # Counted as it arrives too: a chunked upload has no Content-Length to check up front.
+            async for chunk in request.stream():
+                await asyncio.to_thread(pending.write, chunk)
+            await asyncio.to_thread(pending.commit)
         finally:
-            tmp.unlink(missing_ok=True)
+            await asyncio.to_thread(pending.abort)
+
+    def staging():
+        """Where archives are unpacked before being moved in: next to the backups, on the same
+        disk as the servers, and not visible to any game container."""
+        return app.state.backups.root / ".staging"
 
     @app.post("/api/servers/{uuid}/files/extract", dependencies=auth)
     async def extract(uuid: str, body: ExtractRequest, world: bool = False) -> dict[str, str]:
@@ -211,7 +217,7 @@ def create_app(config: AgentConfig | None = None, docker_factory: Callable[[], A
         base = writable_root(uuid)
         if not world:  # plain unzip in the file manager
             dest = await asyncio.to_thread(files.extract_archive, base, body.archive, body.target,
-                                           replace=body.replace, world=False)
+                                           replace=body.replace, world=False, staging_root=staging())
             return {"path": dest}
         # A running server keeps the old world in memory and would save it over the new one, so
         # stop it for the swap and bring it back afterwards.
@@ -221,7 +227,7 @@ def create_app(config: AgentConfig | None = None, docker_factory: Callable[[], A
         try:
             was_running = await asyncio.to_thread(mgr.stop_for_maintenance, uuid)
             dest = await asyncio.to_thread(files.extract_archive, base, body.archive, body.target,
-                                           replace=body.replace, world=True)
+                                           replace=body.replace, world=True, staging_root=staging())
         except Exception as exc:
             error = str(exc)
             raise
@@ -232,7 +238,7 @@ def create_app(config: AgentConfig | None = None, docker_factory: Callable[[], A
 
     @app.get("/api/servers/{uuid}/files/archive", dependencies=auth)
     async def archive(uuid: str, path: str = Query(..., max_length=1024)):
-        base = root(uuid)
+        base = writable_root(uuid)  # not mid-restore: the zip would mix old and new files
         tmp_dir = app.state.backups.root / ".exports"
         tmp_dir.mkdir(parents=True, exist_ok=True)
         out = tmp_dir / f"{uuid}-{secrets.token_hex(8)}.zip"
@@ -252,10 +258,16 @@ def create_app(config: AgentConfig | None = None, docker_factory: Callable[[], A
 
     @app.get("/api/servers/{uuid}/files/download", dependencies=auth)
     async def download_file(uuid: str, path: str = Query(..., max_length=1024)):
-        target = files.resolve(root(uuid), path)
-        if not target.is_file():
-            raise HTTPException(404, "File not found.")
-        return FileResponse(target, filename=target.name)
+        handle, size, name = await asyncio.to_thread(files.open_read, root(uuid), path)
+
+        def chunks():
+            with handle:
+                while chunk := handle.read(1 << 20):
+                    yield chunk
+
+        quoted = urllib.parse.quote(name)
+        return StreamingResponse(chunks(), media_type="application/octet-stream", headers={
+            "Content-Length": str(size), "Content-Disposition": f"attachment; filename*=UTF-8''{quoted}"})
 
     @app.post("/api/servers/{uuid}/files/fetch", dependencies=auth)
     async def fetch(uuid: str, body: FetchRequest) -> dict[str, int]:

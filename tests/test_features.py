@@ -500,3 +500,298 @@ def test_password_guessing_is_throttled_for_signed_in_sessions(admin):
         assert r.status_code == 400
     r = admin.post("/api/auth/password", json={"current_password": "correct-horse-battery", "new_password": "x" * 12})
     assert r.status_code == 429
+
+
+@pytest.mark.anyio
+async def test_racing_creates_cannot_exceed_a_quota(admin, node, monkeypatch):
+    """Two creates sent at once used to both pass the quota check while waiting on Modrinth."""
+    import asyncio
+
+    import httpx
+
+    from hearth_panel.routers import servers as servers_router
+
+    _user(admin, "friend", max_servers=1, max_memory_mb=8192)
+    original = servers_router.resolve_modpack
+
+    async def slow_resolve(*args, **kwargs):
+        await asyncio.sleep(0.05)  # both requests are now past the quota check
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(servers_router, "resolve_modpack", slow_resolve)
+    transport = httpx.ASGITransport(app=admin.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as friend:
+        r = await friend.post("/api/auth/login", json={"username": "friend", "password": "friend-password-1"})
+        assert r.status_code == 200
+        body = {"name": "Pack", "node_id": node["id"], "template": "minecraft-java", "memory_mb": 4096,
+                "accept_eula": True, "modpack": {"provider": "modrinth", "project_id": "cool-pack"}, "start": False}
+        results = await asyncio.gather(friend.post("/api/servers", json=body), friend.post("/api/servers", json=body))
+    codes = sorted(r.status_code for r in results)
+    assert codes == [201, 403], [r.text for r in results]
+    assert len([s for s in admin.get("/api/servers").json() if s["name"] == "Pack"]) == 1
+
+
+def test_first_run_setup_only_creates_one_admin(client):
+    from hearth_panel.models import User
+
+    ctx = client.app.state.ctx
+    with ctx.db.sessionmaker() as db:  # someone else already finished setup
+        db.add(User(username="early", password_hash="x", is_admin=True))
+        db.commit()
+    r = client.post("/api/auth/setup", json={"username": "late", "password": "correct-horse-battery"})
+    assert r.status_code == 409
+    with ctx.db.sessionmaker() as db:
+        assert [u.username for u in db.query(User)] == ["early"]
+
+
+def _wait_for_posts(public, count, seconds=2.0):
+    import time
+
+    for _ in range(int(seconds / 0.02)):
+        if len(public.posts) >= count:
+            return
+        time.sleep(0.02)
+
+
+def test_webhooks_cannot_target_the_panels_own_network(admin, node, public):
+    for url in ("http://agent:8080/api/servers", "http://localhost:8000/x", "http://169.254.169.254/latest/meta-data",
+                "http://10.0.0.5/hook", "https://inside.example.com/hook", "https://metadata.example.com/x",
+                "http://nas.lan/hook"):
+        r = admin.post("/api/admin/webhooks", json={"url": url, "events": []})
+        assert r.status_code == 400 and "HEARTH_ALLOW_PRIVATE_WEBHOOKS" in r.json()["detail"], url
+
+    # A name that was public when saved but now points inside the network is skipped at send time.
+    from conftest import FAKE_DNS
+
+    assert admin.post("/api/admin/webhooks", json={"url": "https://moves.example.com/hook", "events": []}).status_code == 201
+    FAKE_DNS["moves.example.com"] = ["192.168.1.10"]
+    try:
+        admin.post("/api/admin/webhooks/test")
+        _wait_for_posts(public, 1, seconds=0.5)
+        assert not any("moves.example.com" in u for u, _ in public.posts)
+    finally:
+        FAKE_DNS.pop("moves.example.com")
+
+
+def test_private_webhooks_allowed_when_opted_in(admin, public, monkeypatch):
+    import dataclasses
+
+    ctx = admin.app.state.ctx
+    monkeypatch.setattr(ctx, "settings", dataclasses.replace(ctx.settings, allow_private_webhooks=True))
+    assert admin.post("/api/admin/webhooks", json={"url": "http://10.0.0.5/hook", "events": []}).status_code == 201
+    admin.post("/api/admin/webhooks/test")
+    _wait_for_posts(public, 1)
+    assert any(u == "http://10.0.0.5/hook" for u, _ in public.posts)
+
+
+def test_webhooks_do_not_follow_redirects(admin, public):
+    public.redirect_posts_to = "http://169.254.169.254/latest/meta-data"
+    admin.post("/api/admin/webhooks", json={"url": "https://billing.example/hook", "events": []})
+    admin.post("/api/admin/webhooks/test")
+    _wait_for_posts(public, 1)
+    assert [u for u, _ in public.posts] == ["https://billing.example/hook"]
+
+
+def test_share_lookups_cannot_enumerate_usernames(admin, node):
+    friend = _user(admin, "friend", max_servers=2)
+    sid = _create(admin, node, owner_id=friend["id"])["id"]
+    _user(admin, "zoe")
+    _login(admin, "friend", "friend-password-1")
+    for i in range(10):
+        r = admin.post(f"/api/servers/{sid}/shares", json={"username": f"guess{i}", "permissions": []})
+        assert r.status_code == 404
+    r = admin.post(f"/api/servers/{sid}/shares", json={"username": "zoe", "permissions": []})
+    assert r.status_code == 429  # paused, even for a name that exists
+
+
+# ----- full bug check -----------------------------------------------------------------------------
+
+
+class _FakeUpstream:
+    """Stands in for the agent's console socket."""
+
+    sent: list = []
+
+    def __init__(self, *args, **kwargs):
+        import asyncio
+
+        self.queue: asyncio.Queue = asyncio.Queue()
+
+    async def __aenter__(self):
+        await self.queue.put('{"type":"log","data":"[Server] ready\\n"}')
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def send(self, message):
+        _FakeUpstream.sent.append(message)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        return await self.queue.get()
+
+
+def test_console_commands_are_logged_and_access_is_rechecked(admin, node, monkeypatch):
+    import json as _json
+
+    import websockets.asyncio.client
+
+    from hearth_panel.routers import servers as servers_router
+
+    monkeypatch.setattr(websockets.asyncio.client, "connect", _FakeUpstream)
+    monkeypatch.setattr(servers_router, "CONSOLE_RECHECK", 0.2)
+    _FakeUpstream.sent = []
+    sid = _create(admin, node)["id"]
+    _user(admin, "friend")
+    share = admin.post(f"/api/servers/{sid}/shares", json={"username": "friend", "permissions": ["console"]}).json()
+    _login(admin, "friend", "friend-password-1")
+    with admin.websocket_connect(f"/api/servers/{sid}/console") as ws:
+        assert ws.receive_json()["type"] == "log"
+        ws.send_text(_json.dumps({"type": "command", "data": "say hi"}))
+        ws.send_text(_json.dumps({"type": "power", "data": "start"}))  # not a console command: dropped
+        ws.send_text(_json.dumps({"type": "command", "data": "list"}))
+        import time
+
+        for _ in range(50):
+            if len(_FakeUpstream.sent) >= 2:
+                break
+            time.sleep(0.02)
+        assert [_json.loads(m)["data"] for m in _FakeUpstream.sent] == ["say hi", "list"]
+
+        # Access removed while the console is open: the session ends.
+        ctx = admin.app.state.ctx
+        from hearth_panel.models import ServerShare
+
+        with ctx.db.sessionmaker() as db:
+            db.delete(db.get(ServerShare, share["id"]))
+            db.commit()
+        msg = ws.receive_json()
+        while msg["type"] != "error":
+            msg = ws.receive_json()
+        assert "ended" in msg["data"]
+    _login(admin, "admin", "correct-horse-battery")
+    log = admin.get(f"/api/servers/{sid}/activity").json()
+    assert [e["detail"] for e in log if e["action"] == "console.command"] == ["list", "say hi"]
+
+
+def test_cron_star_step_day_fields_are_unrestricted():
+    from datetime import datetime
+
+    from hearth_panel.services.scheduler import Cron
+
+    # "*/2" doesn't count as a day restriction in standard cron, so this means: Mondays that are
+    # also odd-numbered days (AND), not "every odd day OR every Monday".
+    every_other_day_on_mondays = Cron.parse("0 4 */2 * 1")
+    assert every_other_day_on_mondays.matches(datetime(2026, 11, 16, 4, 0)) is False  # Monday the 16th (even)
+    assert every_other_day_on_mondays.matches(datetime(2026, 11, 17, 4, 0)) is False  # Tuesday the 17th
+    assert every_other_day_on_mondays.matches(datetime(2026, 11, 23, 4, 0)) is True   # Monday the 23rd (odd)
+    either = Cron.parse("0 4 1 * 1")  # both really restricted: the 1st OR any Monday
+    assert either.matches(datetime(2026, 11, 16, 4, 0)) and either.matches(datetime(2026, 12, 1, 4, 0))
+
+
+def test_swap_counts_toward_the_memory_quota(admin, node):
+    _user(admin, "friend", max_servers=3, max_memory_mb=4096)
+    _login(admin, "friend", "friend-password-1")
+    body = {"name": "Swappy", "node_id": node["id"], "template": "minecraft-java", "memory_mb": 1024,
+            "swap_mb": 65536, "accept_eula": True, "start": False}
+    r = admin.post("/api/servers", json=body)
+    assert r.status_code == 403 and "quota" in r.json()["detail"]
+    sid = admin.post("/api/servers", json={**body, "swap_mb": 0}).json()["id"]
+    assert admin.patch(f"/api/servers/{sid}", json={"swap_mb": 65536}).status_code == 403
+
+
+def test_players_tab_survives_hand_edited_files(admin, node, agent, monkeypatch):
+    sid = _create(admin, node)["id"]
+    from hearth_panel.services.node_client import NodeClient
+
+    async def odd_file(self, node, uuid, path):
+        return '[{"name": "Steve", "uuid": "x"}, "junk", 42, null]'
+
+    monkeypatch.setattr(NodeClient, "read_file", odd_file)
+    r = admin.get(f"/api/servers/{sid}/players")
+    assert r.status_code == 200 and r.json()["whitelist"] == ["Steve"]
+
+
+def test_https_node_install_command_sets_up_tls(admin):
+    r = admin.post("/api/nodes", json={"name": "VPS", "url": "https://vps.example.com:8443", "public_host": "vps.example.com"})
+    command = r.json()["install_command"]
+    assert "-p 8443:8080" in command and "HEARTH_TLS_CERT=/etc/letsencrypt/live/vps.example.com/fullchain.pem" in command
+    plain = admin.post("/api/nodes", json={"name": "LAN", "url": "http://192.168.1.5:8080", "public_host": "x.lan"})
+    assert "HEARTH_TLS_CERT" not in plain.json()["install_command"]
+
+
+def test_custom_server_environment_is_admin_only_to_read(admin, node):
+    friend = _user(admin, "friend")
+    r = admin.post("/api/servers", json={
+        "name": "Custom", "node_id": node["id"], "template": "custom", "memory_mb": 1024, "owner_id": friend["id"],
+        "start": False, "variables": {"IMAGE": "ghcr.io/x/game:1", "CONTAINER_PORT": 7777,
+                                      "EXTRA_ENV": "ADMIN_PASSWORD=hunter2\nMAX=10"}})
+    assert r.status_code == 201, r.text
+    sid = r.json()["id"]
+    assert admin.get(f"/api/servers/{sid}").json()["variables"]["EXTRA_ENV"].startswith("ADMIN_PASSWORD")
+    _login(admin, "friend", "friend-password-1")
+    seen = admin.get(f"/api/servers/{sid}").json()
+    assert seen["variables"]["EXTRA_ENV"] == "" and "hunter2" not in str(seen)
+    spec = admin.get(f"/api/servers/{sid}/spec").json()
+    assert spec["env"]["ADMIN_PASSWORD"] == "••••••" and "hunter2" not in str(spec)
+    # Saving the settings form sends the masked value back; that must not count as a change.
+    r = admin.patch(f"/api/servers/{sid}", json={"variables": {**seen["variables"]}})
+    assert r.status_code == 200, r.text
+    _login(admin, "admin", "correct-horse-battery")
+    assert "hunter2" in admin.get(f"/api/servers/{sid}").json()["variables"]["EXTRA_ENV"]
+
+
+@pytest.mark.anyio
+async def test_scheduled_restart_is_skipped_if_stopped_during_the_countdown(admin, node, agent, monkeypatch):
+    sid = _create(admin, node)["id"]
+    sched = admin.post(f"/api/servers/{sid}/schedules", json={"name": "Nightly", "cron": "0 4 * * *",
+                                                             "action": "restart", "warn_minutes": 1}).json()
+    scheduler = admin.app.state.scheduler
+
+    async def countdown(*_args):
+        agent.state = "offline"  # someone stopped it while players were being warned
+
+    monkeypatch.setattr(scheduler, "_warn", countdown)
+    agent.state, agent.power = "running", []
+    assert (await scheduler.execute(sched["id"])).startswith("Skipped")
+    assert agent.power == []
+
+
+@pytest.mark.anyio
+async def test_unexpected_schedule_errors_are_recorded(admin, node, monkeypatch):
+    sid = _create(admin, node)["id"]
+    sched = admin.post(f"/api/servers/{sid}/schedules", json={"name": "Say", "cron": "* * * * *",
+                                                             "action": "command", "payload": "say hi"}).json()
+    scheduler = admin.app.state.scheduler
+
+    async def boom(*_args):
+        raise RuntimeError("something unexpected")
+
+    monkeypatch.setattr(scheduler, "_act", boom)
+    assert (await scheduler.execute(sched["id"])) == "Failed: something unexpected"
+    row = next(s for s in admin.get(f"/api/servers/{sid}/schedules").json()["schedules"] if s["id"] == sched["id"])
+    assert row["last_result"] == "Failed: something unexpected"
+
+
+@pytest.mark.anyio
+async def test_auto_sleep_uses_the_motd_and_auto_stop_is_announced_once(admin, node, agent, public):
+    sid = _create(admin, node, variables={"MOTD": "Hearth SMP"})["id"]
+    admin.patch(f"/api/servers/{sid}", json={"auto_stop_minutes": 1, "wake_on_join": True})
+    monitor = admin.app.state.monitor
+    agent.state, agent.command_output = "running", "There are 0 of a max of 20 players online:"
+    for t in (0, 61, 122, 183):
+        await monitor.tick(now=float(t))
+    assert agent.slept and agent.slept[-1][1] == "Hearth SMP"
+
+    sid2 = _create(admin, node, name="Plain")["id"]
+    admin.patch(f"/api/servers/{sid2}", json={"auto_stop_minutes": 1, "wake_on_join": False})
+    monitor.seen.clear()
+    for t in (1000, 1061, 1122, 1183):
+        await monitor.tick(now=float(t))
+    agent.state = "offline"
+    await monitor.tick(now=1200.0)
+    log = admin.get(f"/api/servers/{sid2}/activity").json()
+    assert [e["action"] for e in log].count("server.stopped") == 1

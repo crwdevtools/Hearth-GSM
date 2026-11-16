@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import ipaddress
+import json
 import logging
 import re
 from typing import Any, Literal
@@ -26,9 +27,11 @@ from ..services.events import is_discord_webhook
 from ..services.node_client import NodeError, console_ws_url
 from ..services.provisioning import ProvisionError, build_spec, check_capacity, choose_allocations, claim
 from ..services.status import live_statuses
-from ..templates import MC_SERVER_TYPES, Template, coerce_variables, defaults, get_template
+from ..templates import (MC_SERVER_TYPES, Template, TemplateError, coerce_variables, defaults, get_template,
+                         parse_extra_env)
 
 log = logging.getLogger("hearth.servers")
+CONSOLE_RECHECK = 30  # seconds between access checks on an open console
 router = APIRouter(prefix="/api/servers", tags=["servers"])
 
 Provider = Literal["modrinth", "curseforge"]
@@ -169,7 +172,12 @@ def check_quota(db: Session, user: User, *, add_servers: int = 0, add_memory: in
         return
     if user.max_servers <= 0:
         raise HTTPException(403, "Your account doesn't have a server quota. Ask an admin for one.")
-    query = select(func.count(Server.id), func.coalesce(func.sum(Server.memory_mb), 0)).where(Server.owner_id == user.id)
+    # On PostgreSQL this serialises quota checks per user; SQLite already serialises writes, and
+    # recheck_quota() below catches anything that slipped past a check made before an await.
+    db.execute(select(User.id).where(User.id == user.id).with_for_update())
+    # Swap is memory the server can use too, so it counts toward the quota.
+    query = select(func.count(Server.id), func.coalesce(func.sum(Server.memory_mb + Server.swap_mb), 0)
+                   ).where(Server.owner_id == user.id)
     if exclude_server is not None:
         query = query.where(Server.id != exclude_server)
     count, memory = db.execute(query).one()
@@ -180,12 +188,32 @@ def check_quota(db: Session, user: User, *, add_servers: int = 0, add_memory: in
         raise HTTPException(403, f"Your quota has {left} MB of memory left; this needs {add_memory} MB.")
 
 
+def recheck_quota(db: Session, user: User) -> None:
+    """Run after the new or resized server is flushed but before commit: if requests raced past
+    check_quota(), the totals now include all of them and the late one is rolled back."""
+    if user.is_admin:
+        return
+    try:
+        check_quota(db, user)
+    except HTTPException:
+        db.rollback()
+        raise
+
+
 def _reload_allocations(db: Session, server: Server) -> None:
     db.refresh(server, ["allocations"])
 
 
+# Admin-only text that may hold credentials (e.g. EXTRA_ENV="RCON_PASSWORD=..."): only admins edit
+# it, so only admins see it. Non-admins get "" and sending "" back means "unchanged".
+ADMIN_ONLY_SECRET = {"EXTRA_ENV"}
+
+
 def _out(server: Server, user: User, status: dict | None = None) -> dict[str, Any]:
-    return {**server_out(server, status), "permissions": sorted(permissions_for(server, user))}
+    out = {**server_out(server, status), "permissions": sorted(permissions_for(server, user))}
+    if not user.is_admin:
+        out["variables"] = {k: ("" if k in ADMIN_ONLY_SECRET and v else v) for k, v in out["variables"].items()}
+    return out
 
 
 # ----- list / create ---------------------------------------------------------------------------
@@ -206,7 +234,7 @@ async def create_server(body: ServerCreate, user: User = Depends(current_user), 
     if not user.is_admin:
         if body.owner_id not in (None, user.id):
             raise HTTPException(403, "You can only create servers for yourself.")
-        check_quota(db, user, add_servers=1, add_memory=body.memory_mb)
+        check_quota(db, user, add_servers=1, add_memory=body.memory_mb + body.swap_mb)
     if "eula" in template.features and not body.accept_eula:
         raise HTTPException(400, "Accept the Minecraft EULA to create this server.")
     if body.memory_mb < template.min_memory_mb:
@@ -238,6 +266,8 @@ async def create_server(body: ServerCreate, user: User = Depends(current_user), 
     db.flush()
     for alloc, is_primary in picks:
         claim(db, alloc, server.id, is_primary=is_primary, is_template=not is_primary)
+    if owner.id == user.id:
+        recheck_quota(db, user)
     db.commit()
     db.refresh(server)
     events.emit(context, db, "server.created", server=server, user=user, detail=f"{template.name} on {node.name}")
@@ -293,16 +323,23 @@ async def update_server(server_id: int, body: ServerPatch, user: User = Depends(
         if not user.is_admin:
             if server.owner_id != user.id:
                 raise HTTPException(403, "Only admins and the owner can change resources.")
-            check_quota(db, user, add_memory=resources.get("memory_mb", server.memory_mb), exclude_server=server.id)
+            check_quota(db, user, exclude_server=server.id,
+                        add_memory=resources.get("memory_mb", server.memory_mb) + resources.get("swap_mb", server.swap_mb))
         memory = resources.get("memory_mb", server.memory_mb)
         if memory < template.min_memory_mb:
             raise HTTPException(400, f"{template.name} needs at least {template.min_memory_mb} MB of memory.")
         check_capacity(db, server.node, memory, resources.get("disk_mb", server.disk_mb), exclude_server=server.id)
         for key, value in resources.items():
             setattr(server, key, value)
+        if not user.is_admin:
+            db.flush()
+            recheck_quota(db, user)
         spec_changed = True
     if body.variables is not None:
         current = dict(server.variables or {})
+        if not user.is_admin:  # the masked value coming back unchanged
+            body.variables = {k: v for k, v in body.variables.items()
+                              if not (k in ADMIN_ONLY_SECRET and v in ("", None))}
         locked = {v.key for v in template.variables if v.admin_only}
         if not user.is_admin and any(k in locked and body.variables[k] != current.get(k) for k in body.variables):
             raise HTTPException(403, "Only admins can change the image, ports or environment of a custom server.")
@@ -403,12 +440,15 @@ async def command(body: CommandBody, server: Server = Depends(server_with("conso
 
 
 @router.get("/{server_id}/spec")
-def spec_preview(server: Server = Depends(server_with("settings")), db: Session = Depends(db_session),
-                 context: PanelContext = Depends(ctx)):
+def spec_preview(server: Server = Depends(server_with("settings")), user: User = Depends(current_user),
+                 db: Session = Depends(db_session), context: PanelContext = Depends(ctx)):
     """The exact container spec the node receives (secrets masked), for troubleshooting."""
     spec = build_spec(server, settings_store.curseforge_key(db, context.settings))
     template = get_template(server.template)
     masked = {v.key for v in template.variables if v.secret} | {"CF_API_KEY"}
+    if not user.is_admin and "custom_image" in template.features:
+        with contextlib.suppress(TemplateError):
+            masked |= set(parse_extra_env(str((server.variables or {}).get("EXTRA_ENV") or "")))
     spec["env"] = {k: ("••••••" if k in masked else v) for k, v in spec["env"].items()}
     return spec
 
@@ -521,7 +561,7 @@ async def clone(server_id: int, body: CloneBody, user: User = Depends(current_us
     source = server_for(server_id, user, db, "owner")
     if source.suspended and not user.is_admin:
         raise HTTPException(403, "This server is suspended, so it can't be copied.")
-    check_quota(db, user, add_servers=1, add_memory=source.memory_mb)
+    check_quota(db, user, add_servers=1, add_memory=source.memory_mb + source.swap_mb)
     template = get_template(source.template)
     check_capacity(db, source.node, source.memory_mb, source.disk_mb)
     copy = Server(name=body.name.strip(), description=f"Copy of {source.name}", owner_id=source.owner_id,
@@ -535,6 +575,7 @@ async def clone(server_id: int, body: CloneBody, user: User = Depends(current_us
     db.flush()
     for alloc, is_primary in picks:
         claim(db, alloc, copy.id, is_primary=is_primary, is_template=not is_primary)
+    recheck_quota(db, user)
     db.commit()
     db.refresh(copy)
     warning = await sync(context, db, copy)
@@ -634,6 +675,7 @@ async def console(ws: WebSocket, server_id: int) -> None:
             await ws.close(code=4401)
             return
         url, token = console_ws_url(server.node, server.uuid), server.node.token
+        user_id = user.id
 
     from websockets.asyncio.client import connect
     from websockets.exceptions import WebSocketException
@@ -646,11 +688,43 @@ async def console(ws: WebSocket, server_id: int) -> None:
                 async for message in upstream:
                     await ws.send_text(message if isinstance(message, str) else message.decode())
 
+            def still_allowed() -> tuple[User, Server] | None:
+                """Access can be removed (or the password changed) while a console is open."""
+                with context.db.sessionmaker() as check:
+                    who = websocket_user(ws, check)
+                    srv = check.get(Server, server_id)
+                    if who is None or srv is None or "console" not in permissions_for(srv, who):
+                        return None
+                    return who, srv
+
             async def up() -> None:
                 while True:
-                    await upstream.send(await ws.receive_text())
+                    try:
+                        message = json.loads(await ws.receive_text())
+                    except ValueError:
+                        continue
+                    if not isinstance(message, dict) or message.get("type") != "command":
+                        continue
+                    text = str(message.get("data", ""))[:2000]
+                    if not text.strip():
+                        continue
+                    if still_allowed() is None:
+                        await ws.send_json({"type": "error", "data": "Your access to this console has ended."})
+                        return
+                    with context.db.sessionmaker() as log_db:  # same audit trail as the REST command
+                        who, srv = log_db.get(User, user_id), log_db.get(Server, server_id)
+                        events.emit(context, log_db, "console.command", server=srv, user=who, detail=text)
+                    await upstream.send(json.dumps({"type": "command", "data": text}))
 
-            tasks = [asyncio.create_task(down()), asyncio.create_task(up())]
+            async def watch() -> None:
+                while True:
+                    await asyncio.sleep(CONSOLE_RECHECK)
+                    if still_allowed() is None:
+                        with contextlib.suppress(Exception):
+                            await ws.send_json({"type": "error", "data": "Your access to this console has ended."})
+                        return
+
+            tasks = [asyncio.create_task(down()), asyncio.create_task(up()), asyncio.create_task(watch())]
             done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
             for task in pending:
                 task.cancel()

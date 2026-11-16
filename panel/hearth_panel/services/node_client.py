@@ -46,7 +46,7 @@ class NodeClient:
             except (ValueError, AttributeError):
                 detail = None
             message = detail if isinstance(detail, str) else f"Node returned HTTP {resp.status_code}."
-            status = resp.status_code if resp.status_code in (400, 403, 404, 409, 413, 415) else 502
+            status = resp.status_code if resp.status_code in (400, 403, 404, 409, 413, 415, 429, 507) else 502
             raise NodeError(node.name, message, status)
         if resp.status_code == 204 or not resp.content:
             return None
@@ -179,7 +179,7 @@ async def _stream_call(client: "NodeClient", node: Node, method: str, path: str,
         except ValueError:
             detail = None
         raise NodeError(node.name, detail or f"Node returned HTTP {resp.status_code}.",
-                        resp.status_code if resp.status_code in (400, 404, 409, 413, 415, 507) else 502)
+                        resp.status_code if resp.status_code in (400, 403, 404, 409, 413, 415, 429, 507) else 502)
     return resp
 
 

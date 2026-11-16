@@ -288,6 +288,7 @@ class ServerManager:
 
     def _provision(self, uuid: str, start: bool) -> None:
         st = self._state(uuid)
+        mine: str | None = None
         with self._lock(uuid):
             try:
                 # Always build from the newest spec on disk: if two updates race for the lock,
@@ -303,12 +304,12 @@ class ServerManager:
                 was_running = bool(existing and existing.status in ("running", "restarting"))
                 if existing is not None:
                     if was_running:
-                        st.transition = "stopping"
+                        st.transition = mine = "stopping"
                         existing.stop(timeout=spec.stop_timeout)
                     existing.remove(force=True)
                 container = self.docker.containers.create(**build_create_kwargs(spec, self.host_data_path(uuid)))
                 if start or was_running:
-                    st.transition = "starting"
+                    st.transition = mine = "starting"
                     self._remove_sleeper(uuid)
                     container.start()
                     self._want_running(uuid, True)
@@ -318,7 +319,7 @@ class ServerManager:
                 st.error = _docker_error_text(exc)
                 failed = True
             finally:
-                st.transition = None
+                _end_transition(st, mine)
                 with self._registry_lock:
                     st.pending -= 1
                     if st.pending <= 0:
@@ -339,6 +340,7 @@ class ServerManager:
             self.docker.images.pull(image)
 
     def delete(self, uuid: str, purge: bool) -> None:
+        self.ensure_idle(uuid)
         with self._lock(uuid):
             container = self._container(uuid)
             if container is not None:
@@ -365,7 +367,9 @@ class ServerManager:
         if action in ("stop", "kill") and self._sleeper(uuid) is not None:
             self._remove_sleeper(uuid)  # "stop" on a sleeping server means: stop waking it
             return
-        st.transition = {"start": "starting", "stop": "stopping", "restart": "stopping"}.get(action)
+        mine = {"start": "starting", "stop": "stopping", "restart": "stopping"}.get(action)
+        if mine:
+            st.transition = mine
         self._want_running(uuid, action in ("start", "restart"))
 
         def run() -> None:
@@ -390,7 +394,7 @@ class ServerManager:
                 st.error = None
                 st.oom_kills = 0
             finally:
-                st.transition = None
+                _end_transition(st, mine)
 
         threading.Thread(target=run, name=f"power-{uuid[:8]}", daemon=True).start()
 
@@ -697,11 +701,12 @@ class ServerManager:
         with self._lock(uuid):
             container = self._container(uuid)
             if container is not None and container.status in ("running", "restarting"):
-                self._state(uuid).transition = "stopping"
+                st = self._state(uuid)
+                st.transition = "stopping"
                 try:
                     container.stop(timeout=spec.stop_timeout)
                 finally:
-                    self._state(uuid).transition = None
+                    _end_transition(st, "stopping")
             self._want_running(uuid, False)
             self._remove_sleeper(uuid)
             game = tcp[0]
@@ -726,11 +731,12 @@ class ServerManager:
             self._remove_sleeper(uuid)
             container = self._container(uuid)
             if container is not None and container.status != "running":
-                self._state(uuid).transition = "starting"
+                st = self._state(uuid)
+                st.transition = "starting"
                 try:
                     container.start()
                 finally:
-                    self._state(uuid).transition = None
+                    _end_transition(st, "starting")
             self._want_running(uuid, True)
 
     # ----- cloning -----------------------------------------------------------------------
@@ -744,8 +750,10 @@ class ServerManager:
         container = self._container(uuid)
         if container is not None and container.status == "running":
             raise RuntimeFailure("Stop the server before copying files into it.")
+        from .files import copy_tree
+
         with self._lock(uuid), self.quiesced(source):
-            shutil.copytree(self.data_path(source), self.data_path(uuid), symlinks=True, dirs_exist_ok=True)
+            copy_tree(self.data_path(source), self.data_path(uuid))
 
     # ----- playit.gg tunnel --------------------------------------------------------------
 
@@ -800,6 +808,13 @@ class ServerManager:
             "servers": len(self.known_servers()),
             "storage_path": str(self.host_data_dir),
         }
+
+
+def _end_transition(st: ServerRuntimeState, mine: str | None) -> None:
+    """Clear the transition only if it's still the one this action set. A restore can begin
+    while a power action is finishing; that action must not wipe out "restoring"."""
+    if mine is not None and st.transition == mine:
+        st.transition = None
 
 
 def _status_word(container: Any | None, st: ServerRuntimeState, sleeping: bool = False) -> str:

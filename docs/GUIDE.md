@@ -166,6 +166,18 @@ rebuild if the code changed, and start whatever isn't running.
 The first time you open the panel it asks you to **create the admin account**. That account
 can do everything. Other people get their own accounts from you later ([section 11](#11-users-sharing-quotas-and-suspension)).
 
+Until that account exists, anyone who can reach the panel could claim it. So Hearth only accepts
+it **from the computer running Hearth or your local network**. If you're setting up a cloud
+server and can only reach it over the internet, either use an SSH tunnel
+(`ssh -L 8000:localhost:8000 you@server`, then open http://localhost:8000), or set
+`HEARTH_ALLOW_REMOTE_SETUP=true` in `.env`, restart, create the account, and remove it again.
+
+This check relies on seeing visitors' real addresses. Behind a reverse proxy, list the proxy in
+`HEARTH_TRUSTED_PROXIES` so the panel reads the forwarded address. On Docker Desktop (Windows,
+macOS), connections can arrive from Docker's own internal address, so every visitor looks local.
+Either way, create the admin account straight after installing, before exposing the panel to the
+internet.
+
 You'll find:
 
 - **Servers** (the home page): every server you can see, with live status, memory use, a
@@ -254,6 +266,9 @@ A file manager for the server's folder:
 - Browse, **edit** text files (configs, `server.properties`, scripts) in the browser.
 - **Upload** files (any size), **create folders**, **rename**, **delete**, **download**.
 - **Download a folder as a zip**, and **unzip** an uploaded `.zip` or `.tar.gz` in place.
+- **Symbolic links** in a server's folder are listed, and can be renamed or deleted, but Hearth never
+  opens or follows them. Whatever runs inside the server (a mod, a plugin) can create links, and
+  following one could reach files outside the server. Backups and copies keep links as links.
 - **World tools**: **Download world** zips the current world. The server saves first, so the
   copy isn't half-written. **Import world** replaces the world with an uploaded singleplayer
   world: zip the world's folder from `.minecraft/saves`. Hearth backs up the current world
@@ -490,7 +505,14 @@ finished a backup · failed a backup · was restored · had a scheduled task fai
 ### Webhooks (panel-wide)
 
 For your own tools, add webhooks in **Admin → Settings → Webhooks**: a URL plus the events you
-want (or all of them). Each event is a JSON `POST`:
+want (or all of them).
+
+Webhooks must point at an **internet address**. Addresses on the panel's own machine or network
+are refused: `localhost`, the agent, `192.168.x.x`, cloud metadata services, and names that
+resolve to any of these. The check runs again before every send, and redirects aren't followed.
+To send to a tool on your own network, set `HEARTH_ALLOW_PRIVATE_WEBHOOKS=true`.
+
+Each event is a JSON `POST`:
 
 ```json
 {
@@ -541,8 +563,8 @@ Someone with **no** permissions can still see the server's status and address.
 
 Give a user a **server quota** (how many servers) and optionally a **memory quota** (total MB)
 in Admin → Users. They then get a **New server** button and can create, resize, copy and
-delete their own servers within those limits, on any node. Users without a quota can only use
-servers they were given or shared.
+delete their own servers within those limits, on any node. Swap counts toward the memory quota.
+Users without a quota can only use servers they were given or shared.
 
 ### Suspension
 
@@ -561,12 +583,19 @@ friend's PC. That way one panel manages servers in several places.
 1. **On the panel:** Admin → Nodes → **Add node**.
    - **Name** and **Location**: for you, for example "Hetzner FSN1".
    - **Agent URL**: how the panel reaches the agent, for example `https://vps.example.com:8443`.
+     For an internet address it must be `https://`, because the agent's token would otherwise
+     travel unencrypted. Plain `http://` is accepted for local addresses (`http://192.168.1.20:8080`,
+     `http://nas.lan:8080`). For an internet address over a VPN or private link, tick
+     **Allow plain HTTP**.
    - **Public address**: what players connect to, for example `vps.example.com`.
    - **Memory to assign** and **Disk to assign**: how much of the machine Hearth may hand out.
 2. Hearth shows a **`docker run` command** containing that node's secret token. On the new
    machine, first make the agent image available. Either copy this repository there and run
    `docker build -t hearth-agent:latest agent/`, or push the image to your own registry and set
    `HEARTH_AGENT_IMAGE` on the panel so the command uses it. Then run the command.
+   For an `https://` agent URL the command also mounts `/etc/letsencrypt` and points the agent at
+   the certificate for the node's name. Get one first (for example `certbot certonly --standalone -d
+   vps.example.com`), or edit those lines to point at your own certificate files.
 3. Back on the node's page, **add a port range** (for example `25565-25600`), and open those
    ports in that machine's firewall and its provider's security settings.
 4. The node shows as online with its CPU, memory and disk. Create servers on it like on
@@ -588,16 +617,40 @@ If you can, also restrict the agent's port to the panel's IP address in the fire
 
 ## 13. Security
 
-- **Passwords** are hashed with scrypt, a slow, salted hash. Repeated wrong guesses
-  (8 in 5 minutes) lock that username out from that address for a few minutes. This applies to
-  sign-in and to password checks inside the panel.
+- **Passwords** are hashed with scrypt, a slow, salted hash. Repeated wrong guesses pause
+  sign-in for a few minutes:
+  - 8 failures in 5 minutes for one username from one address;
+  - 30 failures in 15 minutes from one internet address across all usernames, which stops one
+    address trying a common password against every account. Local addresses are exempt: behind
+    Docker Desktop or an untrusted proxy every visitor shares one, and one person's typos would
+    lock everyone out. Behind a reverse proxy, set `HEARTH_TRUSTED_PROXIES` so the panel sees
+    real addresses.
+
+  The same applies to password checks inside the panel. The counts reset when the panel restarts.
+- **Breached passwords are refused.** When a password is set, Hearth asks
+  [Have I Been Pwned](https://haveibeenpwned.com/Passwords) whether it appears in known data
+  breaches. Only the first 5 characters of the password's SHA-1 hash are sent; the match is
+  made inside Hearth. If the service can't be reached, the password is allowed. Turn the check
+  off with `HEARTH_BREACHED_PASSWORD_CHECK=false`.
 - **Two-factor sign-in**: Account → **Set up two-factor sign-in**. Scan the QR code with any
   authenticator app (Google Authenticator, Authy, 1Password, Bitwarden…) and enter a code to
   confirm. Each code works only once. If someone loses their phone, an admin can reset their
   two-factor sign-in in Admin → Users. That also signs them out everywhere and revokes their
   API tokens.
 - **Sessions** are signed cookies (`HttpOnly`, `SameSite=Strict`). Changing a password signs
-  out every other session.
+  out every other session, and **Account → Sign out everywhere** ends every session at once,
+  including a cookie copied from a lost or shared device. API tokens keep working.
+- **Open consoles are re-checked.** If someone's access is removed while their console is open, it
+  closes within 30 seconds. Every command typed in a console is in the activity log.
+- **Custom-image environments are admin-only.** Only admins can see or change a custom server's
+  environment lines, which often hold passwords. If you set `HEARTH_SECRET_KEY` yourself, make it at least 32 random
+  characters; the panel logs a warning when it's shorter.
+- **Sharing lookups are limited.** Sharing a server says whether a username exists, so non-admins
+  get 10 names that don't match per 10 minutes.
+- **The panel can't be framed** by other sites (`frame-ancestors 'none'` and `X-Frame-Options: DENY`).
+- **Base images are refreshed.** `start.sh` / `start.bat` build with `--pull`, so security fixes to
+  the Python base image are picked up each time you start Hearth. Offline, the cached image is
+  used.
 - **Put the panel behind HTTPS** if it's reachable from the internet. For example, Caddy:
   ```
   panel.example.com {
@@ -668,7 +721,7 @@ Hearth has no payment provider built in, but it has the pieces to connect one:
 | `CURSEFORGE_API_KEY` | *(empty)* | Enables CurseForge modpacks. Can also be set in Admin → Settings. |
 | `HEARTH_UPDATE_INTERVAL_MINUTES` | `360` | How often to check for modpack updates. Admin → Settings overrides it. |
 | `HEARTH_COOKIE_SECURE` | `false` | Set `true` when the panel is served over HTTPS. |
-| `HEARTH_SECRET_KEY` | *(generated)* | Signs sign-in sessions. If empty, one is generated and kept in the database. |
+| `HEARTH_SECRET_KEY` | *(generated)* | Signs sign-in sessions. If empty, one is generated and kept in the database. If you set it, use 32+ random characters. |
 
 ### Panel environment (advanced)
 
@@ -676,7 +729,10 @@ Hearth has no payment provider built in, but it has the pieces to connect one:
 |---|---|---|
 | `HEARTH_DATABASE_URL` | SQLite in the panel's volume | Any SQLAlchemy URL, for example PostgreSQL. |
 | `HEARTH_AGENT_IMAGE` | `hearth-agent:latest` | Image name used in the remote-node install command. |
-| `HEARTH_TRUSTED_PROXIES` | `127.0.0.1` | Proxies allowed to set `X-Forwarded-For` (used for sign-in lockouts). |
+| `HEARTH_TRUSTED_PROXIES` | `127.0.0.1` | Proxies allowed to set `X-Forwarded-For` (used for sign-in lockouts and the local-network setup check). |
+| `HEARTH_ALLOW_REMOTE_SETUP` | `false` | Allow creating the first admin account from outside the local network. |
+| `HEARTH_ALLOW_PRIVATE_WEBHOOKS` | `false` | Allow webhooks to local-network addresses. |
+| `HEARTH_BREACHED_PASSWORD_CHECK` | `true` | Refuse passwords found in known data breaches. |
 | `TZ` | `UTC` | Fallback time zone for schedules when none is set in Admin → Settings. |
 
 ### Agent environment

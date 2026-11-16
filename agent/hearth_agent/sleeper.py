@@ -94,9 +94,13 @@ class Sleeper:
             if first[0] & 0x80:  # multi-byte length: finish reading the VarInt
                 shift, byte = 7, first[0]
                 while byte & 0x80:
-                    byte = (await reader.readexactly(1))[0]
+                    if shift > 14:  # a handshake is tiny; refuse instead of buffering junk
+                        return
+                    byte = (await asyncio.wait_for(reader.readexactly(1), 10))[0]
                     length |= (byte & 0x7F) << shift
                     shift += 7
+            if not 0 < length <= 1024:
+                return
             data = await asyncio.wait_for(reader.readexactly(length), 10)
             packet_id, pos = decode_varint(data, 0)
             if packet_id != 0x00:

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import os
+import stat
 import logging
 import shutil
 import tarfile
@@ -83,16 +85,7 @@ class BackupStore:
         patterns = DEFAULT_IGNORE + list(ignore)
         try:
             with self.manager.quiesced(uuid), tarfile.open(partial, "w:gz", compresslevel=6) as tar:
-                for path in sorted(source.rglob("*")):
-                    rel = path.relative_to(source).as_posix()
-                    if any(fnmatch.fnmatch(rel, pat) for pat in patterns):
-                        continue
-                    if path.is_dir() and not path.is_symlink():
-                        continue  # directories are recreated from file paths
-                    try:
-                        tar.add(path, arcname=rel, recursive=False)
-                    except (FileNotFoundError, PermissionError) as exc:  # file vanished mid-backup
-                        log.info("skipped %s: %s", rel, exc)
+                _add_tree(tar, source, patterns)
             partial.replace(target)
             self._write_meta(uuid, backup_id, state="ready", size=target.stat().st_size, error=None,
                              finished=time.time())
@@ -118,17 +111,17 @@ class BackupStore:
     def _restore(self, uuid: str, archive: Path) -> None:
         manager = self.manager
         was_running = False
+        dest = manager.data_path(uuid)
+        staging = dest.with_name(f".{dest.name}.restoring")
+        old = dest.with_name(f".{dest.name}.old")
         try:
             was_running = manager.stop_for_maintenance(uuid)
-            dest = manager.data_path(uuid)
-            staging = dest.with_name(f".{dest.name}.restoring")
             shutil.rmtree(staging, ignore_errors=True)
             staging.mkdir(parents=True)
             with tarfile.open(archive, "r:gz") as tar:
                 # The "data" filter rejects absolute paths, ../ escapes, links pointing outside,
                 # and device files, so a tampered archive can't write outside the server folder.
                 tar.extractall(staging, filter="data")
-            old = dest.with_name(f".{dest.name}.old")
             shutil.rmtree(old, ignore_errors=True)
             if dest.exists():
                 dest.rename(old)
@@ -137,7 +130,12 @@ class BackupStore:
             manager.end_restore(uuid, error=None, start=was_running)
         except Exception as exc:
             log.exception("restore of %s failed", uuid)
-            manager.end_restore(uuid, error=f"Restore failed: {exc}"[:500], start=was_running)
+            # Put the server's own files back if they were already moved aside, and drop the
+            # half-unpacked copy so a failed restore (often a full disk) doesn't keep the disk full.
+            if not dest.exists() and old.exists():
+                old.rename(dest)
+            shutil.rmtree(staging, ignore_errors=True)
+            manager.end_restore(uuid, error=f"Restore failed, nothing was changed: {exc}"[:500], start=was_running)
 
     def delete(self, uuid: str, backup_id: str) -> None:
         if (uuid, backup_id) in self._active:
@@ -153,9 +151,38 @@ class BackupStore:
         return sum(f.stat().st_size for f in self.root.rglob("*.tar.gz") if f.is_file())
 
 
-def free_bytes(path: Path) -> int:
-    try:
-        return shutil.disk_usage(path).free
-    except OSError:
-        return 0
+def _add_tree(tar: tarfile.TarFile, source: Path, patterns: list[str]) -> None:
+    """Archive a live server folder through fds (see files.py): a mod swapping a folder for a
+    link mid-backup can't make the agent read files from outside the server folder."""
+    from . import files
+
+    with files.Dir(source, []) as top:
+        for rel, dirs, names, fd in files.walk(top):
+            for name in sorted(dirs):  # keep empty folders too
+                path = files._join(rel, name)
+                if any(fnmatch.fnmatch(path, pat) or fnmatch.fnmatch(path + "/-", pat) for pat in patterns):
+                    dirs.remove(name)  # e.g. "cache/*": skip the folder and don't walk into it
+                    continue
+                info = tarfile.TarInfo(path)
+                info.type, info.mode = tarfile.DIRTYPE, 0o755
+                tar.addfile(info)
+            for name in sorted(names):
+                path = files._join(rel, name)
+                if any(fnmatch.fnmatch(path, pat) for pat in patterns):
+                    continue
+                try:
+                    st = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                    if stat.S_ISLNK(st.st_mode):
+                        info = tarfile.TarInfo(path)
+                        info.type, info.linkname = tarfile.SYMTYPE, os.readlink(name, dir_fd=fd)
+                        info.mtime = int(st.st_mtime)
+                        tar.addfile(info)
+                        continue
+                    file_fd = files._open_regular(name, fd)
+                except (OSError, files.FileAccessError) as exc:  # vanished, or a FIFO/socket
+                    log.info("skipped %s: %s", path, exc)
+                    continue
+                with os.fdopen(file_fd, "rb") as f:
+                    info = tar.gettarinfo(arcname=path, fileobj=f)
+                    tar.addfile(info, f)
 

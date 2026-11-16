@@ -57,10 +57,12 @@ export async function backupsTab(panel, ctx) {
   const name = h("input", { placeholder: "Name (optional)", maxlength: 128, "aria-label": "Backup name", style: { maxWidth: "280px" } });
   const create = h("button", { class: "btn primary", type: "button" }, icon("plus"), "Back up now");
   let timer = null;
+  let closed = false;  // a request in flight when the tab closes mustn't start polling again
 
   async function load() {
     const rows = await get(`/servers/${s.id}/backups`);
     clearTimeout(timer);
+    if (closed) return;
     if (rows.some((b) => b.state === "creating")) timer = setTimeout(() => load().catch(() => {}), 3000);
     if (!rows.length) return replace(tbody, emptyRow(5, "No backups yet. Make one now, or add a nightly backup under Schedules."));
     replace(tbody, rows.map((b) => {
@@ -113,7 +115,7 @@ export async function backupsTab(panel, ctx) {
       h("span", { class: "faint", style: { fontSize: "13px" } }, "Hearth also backs up automatically before modpack updates, version changes and restores.")),
     table([{ label: "Backup" }, { label: "State" }, { label: "Size", cls: "right hide-sm" }, { label: "", cls: "hide-md" }, { label: h("span", { class: "sr-only" }, "Actions") }], tbody));
   await load();
-  return () => clearTimeout(timer);
+  return () => { closed = true; clearTimeout(timer); };
 }
 
 // ----- schedules ---------------------------------------------------------------------------------

@@ -7,6 +7,7 @@ import ipaddress
 import os
 import re
 from typing import Any
+from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field, field_validator
@@ -19,6 +20,7 @@ from ..deps import admin_user, ctx, current_user, db_session
 from ..models import Allocation, Node, User
 from ..security import new_node_token
 from ..serializers import allocation_out, node_out
+from ..services.netguard import host_is_local
 from ..services.node_client import NodeError
 
 router = APIRouter(prefix="/api/nodes", tags=["nodes"])
@@ -52,8 +54,22 @@ class NodePatch(BaseModel):
     memory_mb: int | None = Field(default=None, ge=0)
     disk_mb: int | None = Field(default=None, ge=0)
 
+    allow_insecure: bool = False  # not stored: confirms a plain-HTTP agent URL on a public address
+
     _v_url = field_validator("url")(classmethod(lambda cls, v: _clean_url(v)))
     _v_host = field_validator("public_host")(classmethod(lambda cls, v: _clean_host(v)))
+
+
+def check_agent_url(url: str | None, allow_insecure: bool) -> None:
+    """The agent's token controls Docker on that machine; don't send it unencrypted across the
+    internet unless the admin says that's intended."""
+    if not url or not url.startswith("http://") or allow_insecure:
+        return
+    host = urlsplit(url).hostname or ""
+    if not host_is_local(host):
+        raise HTTPException(400, f"{host} looks like an internet address, so the agent's token would be sent "
+                                 "unencrypted. Use an https:// URL (see the guide), or tick "
+                                 "“Allow plain HTTP” if this machine is only reachable on a private network.")
 
 
 class NodeBody(NodePatch):
@@ -103,11 +119,20 @@ def install_command(node: Node) -> str:
     """The `docker run` line an admin pastes on the machine that becomes this node."""
     port = re.search(r":(\d+)", node.url.split("//", 1)[-1])
     host_port = port.group(1) if port else ("443" if node.url.startswith("https") else "80")
+    tls = ""
+    domain = urlsplit(node.url).hostname or "your-domain"
+    if node.url.startswith("https://"):
+        # The panel will speak HTTPS, so the agent must too: point these at the certificate
+        # for the node's name (e.g. from certbot), or put a reverse proxy in front instead.
+        tls = ("  -v /etc/letsencrypt:/etc/letsencrypt:ro \\\n"
+               f"  -e HEARTH_TLS_CERT=/etc/letsencrypt/live/{domain}/fullchain.pem \\\n"
+               f"  -e HEARTH_TLS_KEY=/etc/letsencrypt/live/{domain}/privkey.pem \\\n")
     return (
         "docker run -d --name hearth-agent --restart unless-stopped \\\n"
         f"  -p {host_port}:8080 \\\n"
         "  -v /var/run/docker.sock:/var/run/docker.sock \\\n"
         "  -v /var/lib/hearth:/var/lib/hearth \\\n"
+        f"{tls}"
         f"  -e HEARTH_AGENT_TOKEN={node.token} \\\n"
         f"  {AGENT_IMAGE}"
     )
@@ -159,7 +184,8 @@ async def list_nodes(_: User = Depends(admin_user), db: Session = Depends(db_ses
 
 @router.post("", status_code=201)
 def create_node(body: NodeBody, _: User = Depends(admin_user), db: Session = Depends(db_session)):
-    node = Node(**body.model_dump(), token=new_node_token())
+    check_agent_url(body.url, body.allow_insecure)
+    node = Node(**body.model_dump(exclude={"allow_insecure"}), token=new_node_token())
     db.add(node)
     try:
         db.commit()
@@ -185,7 +211,9 @@ async def get_node(node_id: int, _: User = Depends(admin_user), db: Session = De
 @router.patch("/{node_id}")
 def update_node(node_id: int, body: NodePatch, _: User = Depends(admin_user), db: Session = Depends(db_session)):
     node = _get(db, node_id)
-    for key, value in body.model_dump(exclude_none=True).items():
+    if body.url is not None and body.url != node.url:
+        check_agent_url(body.url, body.allow_insecure)
+    for key, value in body.model_dump(exclude_none=True, exclude={"allow_insecure"}).items():
         setattr(node, key, value)
     try:
         db.commit()

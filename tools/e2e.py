@@ -467,7 +467,7 @@ def two_factor(browser):
     page.get_by_label("Code from the app").fill(totp_now(secret))
     page.get_by_role("button", name="Confirm and turn on").click()
     toast(page, "Two-factor sign-in is on")
-    page.get_by_role("button", name="Sign out").click()
+    page.get_by_role("button", name="Sign out", exact=True).click()
     page.fill("input[name=username]", "sam")
     page.fill("input[name=password]", "friend-password-1")
     page.click("button[type=submit]")

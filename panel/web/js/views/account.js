@@ -8,7 +8,18 @@ export async function renderAccount(root, { me, setCrumbs, refreshMe }) {
     h("div", { class: "page-head" }, h("div", {}, h("h1", {}, me.username),
       h("p", { class: "muted", style: { marginTop: "8px" } }, me.is_admin ? "Administrator"
         : me.max_servers ? `Member · can create up to ${me.max_servers} server${me.max_servers === 1 ? "" : "s"}` : "Member"))),
-    passwordSection(), await twoFactorSection(me, refreshMe), await tokensSection());
+    passwordSection(), await twoFactorSection(me, refreshMe), await tokensSection(), sessionsSection());
+}
+
+function sessionsSection() {
+  const out = h("button", { class: "btn", type: "button" }, icon("out"), "Sign out everywhere");
+  out.addEventListener("click", () => busy(out, async () => {
+    if (!(await confirmDialog({ title: "Sign out everywhere?", body: "Every browser signed in to your account, including this one, is signed out. API tokens keep working.", confirm: "Sign out everywhere" }))) return;
+    await post("/auth/logout-everywhere");
+    location.hash = "#/";
+    location.reload();
+  }));
+  return section("Sessions", "Lost a device, or signed in on a shared computer? End every session at once.", h("div", {}, out));
 }
 
 function passwordSection() {

@@ -28,6 +28,9 @@ class Settings:
     local_node_token: str | None = None
     local_node_url: str = "http://agent:8080"
     local_public_host: str = "localhost"
+    allow_remote_setup: bool = False
+    allow_private_webhooks: bool = False
+    breached_password_check: bool = True
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -47,4 +50,7 @@ class Settings:
             local_node_token=os.environ.get("HEARTH_AGENT_TOKEN") or None,
             local_node_url=os.environ.get("HEARTH_LOCAL_NODE_URL", "http://agent:8080"),
             local_public_host=os.environ.get("HEARTH_PUBLIC_HOST", "localhost"),
+            allow_remote_setup=_bool("HEARTH_ALLOW_REMOTE_SETUP", False),
+            allow_private_webhooks=_bool("HEARTH_ALLOW_PRIVATE_WEBHOOKS", False),
+            breached_password_check=_bool("HEARTH_BREACHED_PASSWORD_CHECK", True),
         )

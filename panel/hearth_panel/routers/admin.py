@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 from ..context import PanelContext
 from ..deps import admin_user, ctx, db_session
 from ..models import Allocation, AuditLog, Node, Server, User, Webhook
-from ..services import events, settings_store, updater
+from ..services import events, netguard, settings_store, updater
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
 
@@ -110,10 +110,16 @@ def list_webhooks(_: User = Depends(admin_user), db: Session = Depends(db_sessio
 
 
 @router.post("/webhooks", status_code=201)
-def create_webhook(body: WebhookBody, _: User = Depends(admin_user), db: Session = Depends(db_session)):
+async def create_webhook(body: WebhookBody, _: User = Depends(admin_user), db: Session = Depends(db_session),
+                         context: PanelContext = Depends(ctx)):
     unknown = set(body.events) - set(events.EVENT_NAMES)
     if unknown:
         raise HTTPException(400, f"Unknown event: {', '.join(sorted(unknown))}")
+    if not context.settings.allow_private_webhooks:
+        reason = await netguard.public_destination(body.url, context.resolver)
+        if reason:
+            raise HTTPException(400, f"Webhooks can only go to internet addresses: {reason}. "
+                                     "To allow local ones, set HEARTH_ALLOW_PRIVATE_WEBHOOKS=true and restart.")
     row = Webhook(url=body.url, events=body.events, enabled=body.enabled, secret=secrets.token_hex(24))
     db.add(row)
     db.commit()
@@ -130,7 +136,8 @@ def delete_webhook(webhook_id: int, _: User = Depends(admin_user), db: Session =
 
 
 @router.post("/webhooks/test")
-def test_webhooks(admin: User = Depends(admin_user), db: Session = Depends(db_session),
-                  context: PanelContext = Depends(ctx)):
+async def test_webhooks(admin: User = Depends(admin_user), db: Session = Depends(db_session),
+                        context: PanelContext = Depends(ctx)):
+    # async: notifications are only sent from the event loop, never from a worker thread
     events.emit(context, db, "server.started", user=admin, detail="Test event from Hearth (no server changed).")
     return {"sent": True}

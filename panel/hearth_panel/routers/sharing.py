@@ -46,8 +46,13 @@ def list_shares(server: Server = Depends(owner_access)):
 @router.post("", status_code=201)
 def add(body: ShareBody, server: Server = Depends(owner_access), user: User = Depends(current_user),
         db: Session = Depends(db_session), context: PanelContext = Depends(ctx)):
+    key = f"share-lookup:{user.id}"
+    if not user.is_admin and context.share_throttle.blocked(key):
+        raise HTTPException(429, "Too many names that didn't match. Try again in a few minutes.")
     friend = db.scalar(select(User).where(func.lower(User.username) == body.username.strip().lower()))
     if friend is None:
+        if not user.is_admin:
+            context.share_throttle.fail(key)
         raise HTTPException(404, "No user with that name. An admin can add them under Admin → Users.")
     if friend.id == server.owner_id:
         raise HTTPException(400, "They already own this server.")

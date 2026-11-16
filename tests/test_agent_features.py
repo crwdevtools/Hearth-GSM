@@ -1,6 +1,7 @@
 """Agent features: backups, imports, downloads, cloning, metrics, wake-on-join, tunnel."""
 
 import asyncio
+import gzip
 import io
 import json
 import socket
@@ -320,10 +321,7 @@ def test_archive_too_big_for_the_disk_is_refused(env, monkeypatch):
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("big.bin", b"\0" * (2 << 20))
     client.put(f"/api/servers/{UUID}/files/upload", params={"path": "/b.zip"}, content=buf.getvalue(), headers=AUTH)
-    from collections import namedtuple
-
-    usage = namedtuple("usage", "total used free")
-    monkeypatch.setattr(files.shutil, "disk_usage", lambda _: usage(1 << 30, 0, 256 * 1024 * 1024 + (1 << 20)))
+    monkeypatch.setattr(files, "free_space", lambda _fd: 256 * 1024 * 1024 + (1 << 20))
     r = client.post(f"/api/servers/{UUID}/files/extract", headers=AUTH, json={"archive": "/b.zip", "target": "/x"})
     assert r.status_code == 507 and not (tmp / "servers" / UUID / "x" / "big.bin").exists()
 
@@ -349,3 +347,191 @@ def test_wake_url_uses_https_when_the_agent_does(env, monkeypatch):
     monkeypatch.setenv("HEARTH_TLS_CERT", "/certs/agent.pem")
     client.post(f"/api/servers/{UUID}/sleep", json={}, headers=AUTH)
     assert docker.containers.get(f"hearth-sleep-{UUID}").kwargs["environment"]["WAKE_URL"].startswith("https://")
+
+
+def test_mod_download_redirects_must_stay_on_allowed_hosts():
+    import urllib.request
+
+    from hearth_agent.files import FileAccessError, _AllowlistRedirects
+
+    handler = _AllowlistRedirects()
+    req = urllib.request.Request("https://cdn.modrinth.com/data/abc/versions/1/mod.jar")
+    ok = handler.redirect_request(req, None, 302, "Found", {}, "https://edge.forgecdn.net/files/1/mod.jar")
+    assert ok.full_url == "https://edge.forgecdn.net/files/1/mod.jar"
+    for bad in ("http://169.254.169.254/latest/meta-data", "http://agent:8080/api/servers", "https://evil.example/x",
+                "http://cdn.modrinth.com/plain-http.jar"):
+        with pytest.raises(FileAccessError):
+            handler.redirect_request(req, None, 302, "Found", {}, bad)
+
+
+# ----- symlink planting: a mod in the container controls the server folder ----------------------
+
+
+def _planted(tmp):
+    """A server folder where game code has planted links to the host's files."""
+    root = tmp / "servers" / UUID
+    secret_dir = tmp / "host-secrets"
+    secret_dir.mkdir(exist_ok=True)
+    (secret_dir / "shadow").write_text("root:$6$hash")
+    (root / "plugins").mkdir(parents=True, exist_ok=True)
+    (root / "evil-dir").symlink_to(secret_dir)  # a folder swapped for a link
+    (root / "evil-file").symlink_to(secret_dir / "shadow")
+    return root, secret_dir
+
+
+def test_planted_links_are_never_followed_by_file_operations(env):
+    client, _, tmp = env
+    install(client)
+    root, secret_dir = _planted(tmp)
+    for path in ("/evil-dir/shadow", "/evil-file"):
+        assert client.get(f"/api/servers/{UUID}/files/content", params={"path": path}, headers=AUTH).status_code in (403, 404)
+        assert client.get(f"/api/servers/{UUID}/files/download", params={"path": path}, headers=AUTH).status_code in (403, 404)
+    assert client.get(f"/api/servers/{UUID}/files", params={"path": "/evil-dir"}, headers=AUTH).status_code == 403
+    r = client.put(f"/api/servers/{UUID}/files/content", json={"path": "/evil-dir/authorized_keys", "content": "x"}, headers=AUTH)
+    assert r.status_code == 403 and not (secret_dir / "authorized_keys").exists()
+    r = client.put(f"/api/servers/{UUID}/files/upload", params={"path": "/evil-dir/x.jar"}, content=b"jar", headers=AUTH)
+    assert r.status_code == 403 and not (secret_dir / "x.jar").exists()
+    # Writing over the link itself replaces the link, never the file it points to.
+    client.put(f"/api/servers/{UUID}/files/content", json={"path": "/evil-file", "content": "mine"}, headers=AUTH)
+    assert (secret_dir / "shadow").read_text() == "root:$6$hash" and (root / "evil-file").read_text() == "mine"
+    assert client.delete(f"/api/servers/{UUID}/files", params={"path": "/evil-dir"}, headers=AUTH).status_code == 204
+    assert (secret_dir / "shadow").exists() and not (root / "evil-dir").is_symlink()
+
+
+def test_world_import_replaces_a_planted_link_instead_of_writing_through_it(env):
+    client, _, tmp = env
+    install(client)
+    root, secret_dir = _planted(tmp)
+    (root / "world").symlink_to(secret_dir)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("w/level.dat", "new world")
+    client.put(f"/api/servers/{UUID}/files/upload", params={"path": "/w.zip"}, content=buf.getvalue(), headers=AUTH)
+    r = client.post(f"/api/servers/{UUID}/files/extract", params={"world": "true"}, headers=AUTH,
+                    json={"archive": "/w.zip", "target": "/world", "replace": True})
+    assert r.status_code == 200, r.text
+    assert not (root / "world").is_symlink() and (root / "world" / "level.dat").read_text() == "new world"
+    assert sorted(p.name for p in secret_dir.iterdir()) == ["shadow"]
+    assert not any(p.name.startswith((".hearth-extract", "extract-")) for p in root.iterdir())  # unpacked elsewhere
+
+
+def test_backups_zips_and_copies_store_links_not_host_files(env):
+    client, docker, tmp = env
+    install(client)
+    root, _ = _planted(tmp)
+    (root / "plugins" / "ok.jar").write_text("jar")
+    client.post(f"/api/servers/{UUID}/backups", json={"backup_id": BACKUP}, headers=AUTH)
+    wait(lambda: client.get(f"/api/servers/{UUID}/backups/{BACKUP}", headers=AUTH).json()["state"] == "ready")
+    raw = client.get(f"/api/servers/{UUID}/backups/{BACKUP}/download", headers=AUTH).content
+    with tarfile.open(fileobj=io.BytesIO(raw)) as tar:
+        members = {m.name: m for m in tar.getmembers()}
+        assert members["evil-file"].issym() and members["evil-dir"].issym()
+        assert not any(name.startswith("evil-dir/") for name in members)
+    assert b"root:$6$hash" not in gzip.decompress(raw)
+
+    zipped = client.get(f"/api/servers/{UUID}/files/archive", params={"path": "/"}, headers=AUTH).content
+    names = zipfile.ZipFile(io.BytesIO(zipped)).namelist()
+    assert any(n.endswith("plugins/ok.jar") for n in names) and not any("evil" in n for n in names)
+
+    from hearth_agent.files import copy_tree
+
+    copy = tmp / "servers" / "copy"
+    copy_tree(root, copy)
+    assert (copy / "evil-file").is_symlink() and (copy / "plugins" / "ok.jar").read_text() == "jar"
+    assert not (copy / "evil-dir" / "shadow").is_file() or (copy / "evil-dir").is_symlink()
+
+
+def test_chunked_upload_without_length_is_still_capped_by_free_space(env, monkeypatch):
+    client, _, tmp = env
+    install(client)
+    monkeypatch.setattr(files, "free_space", lambda _fd: files.FREE_SPACE_MARGIN + 1000)
+
+    def body():
+        for _ in range(10):
+            yield b"x" * 500
+
+    r = client.put(f"/api/servers/{UUID}/files/upload", params={"path": "/big.bin"}, content=body(), headers=AUTH)
+    assert r.status_code == 507
+    root = tmp / "servers" / UUID
+    assert not (root / "big.bin").exists() and not any(p.name.endswith(".hearth-tmp") for p in root.iterdir())
+
+
+def test_sleeper_hangs_up_on_oversized_handshakes():
+    from hearth_agent.sleeper import Sleeper, encode_varint
+
+    async def scenario():
+        sleeper = Sleeper("zzz", None)
+        reader = asyncio.StreamReader()
+        reader.feed_data(encode_varint(50_000_000))  # claims a 50 MB handshake
+        closed = []
+
+        class Writer:
+            def write(self, _data): pass
+            async def drain(self): pass
+            def close(self): closed.append(True)
+
+        await asyncio.wait_for(sleeper.handle(reader, Writer()), 2)
+        return closed
+
+    assert asyncio.run(scenario()) == [True]
+
+
+def test_ids_with_trailing_newline_are_rejected():
+    from hearth_agent.models import UUID_RE
+
+    assert UUID_RE.match(UUID) and not UUID_RE.match(UUID + "\n")
+
+
+def test_power_action_finishing_during_restore_keeps_the_restore_lock(env):
+    client, _, _ = env
+    install(client, start=True)
+    manager = client.app.state.manager
+    st = manager._state(UUID)
+    st.transition = "stopping"  # a stop is in flight...
+    manager.begin_restore(UUID)  # ...when a restore begins
+    from hearth_agent.runtime import _end_transition
+
+    _end_transition(st, "stopping")  # the stop finishes
+    assert manager.busy(UUID)  # still locked for the restore
+    assert client.delete(f"/api/servers/{UUID}", headers=AUTH).status_code == 409
+    manager.end_restore(UUID, error=None, start=False)
+
+
+def test_failed_restore_leaves_the_server_as_it_was(env):
+    client, _, tmp = env
+    install(client, start=True)
+    root = tmp / "servers" / UUID
+    (root / "world").mkdir(parents=True)
+    (root / "world" / "level.dat").write_text("current")
+    client.post(f"/api/servers/{UUID}/backups", json={"backup_id": BACKUP}, headers=AUTH)
+    wait(lambda: client.get(f"/api/servers/{UUID}/backups/{BACKUP}", headers=AUTH).json()["state"] == "ready")
+    archive = client.app.state.backups.archive_path(UUID, BACKUP)
+    archive.write_bytes(archive.read_bytes()[: len(archive.read_bytes()) // 2])  # truncated: fails mid-unpack
+    assert client.post(f"/api/servers/{UUID}/backups/{BACKUP}/restore", headers=AUTH).status_code == 202
+    status = wait(lambda: (s := client.get(f"/api/servers/{UUID}", headers=AUTH).json())["state"] != "restoring" and s, 15)
+    assert "Restore failed" in (status["error"] or "")
+    assert (root / "world" / "level.dat").read_text() == "current"
+    assert not any(p.name.startswith(f".{UUID}") for p in root.parent.iterdir())  # no leftovers
+
+
+def test_restore_failing_after_the_swap_puts_the_old_files_back(env, monkeypatch):
+    from pathlib import Path
+
+    client, _, tmp = env
+    install(client)
+    root = tmp / "servers" / UUID
+    (root / "world").mkdir(parents=True)
+    (root / "world" / "level.dat").write_text("current")
+    client.post(f"/api/servers/{UUID}/backups", json={"backup_id": BACKUP}, headers=AUTH)
+    wait(lambda: client.get(f"/api/servers/{UUID}/backups/{BACKUP}", headers=AUTH).json()["state"] == "ready")
+    real_rename = Path.rename
+
+    def flaky(self, target):
+        if self.name.endswith(".restoring"):
+            raise OSError(28, "No space left on device")
+        return real_rename(self, target)
+
+    monkeypatch.setattr(Path, "rename", flaky)
+    client.post(f"/api/servers/{UUID}/backups/{BACKUP}/restore", headers=AUTH)
+    wait(lambda: client.get(f"/api/servers/{UUID}", headers=AUTH).json()["state"] != "restoring", 15)
+    assert (root / "world" / "level.dat").read_text() == "current"

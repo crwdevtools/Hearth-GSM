@@ -82,10 +82,13 @@ function nodeForm(node = {}) {
     public_host: h("input", { id: "n-host", class: "mono", value: node.public_host || "", required: true, placeholder: "play.example.com or 203.0.113.7" }),
     memory_mb: h("input", { id: "n-mem", type: "number", min: 0, step: 1024, value: node.memory_mb ?? 0 }),
     disk_mb: h("input", { id: "n-disk", type: "number", min: 0, step: 1024, value: node.disk_mb ?? 0 }),
+    allow_insecure: h("input", { id: "n-insecure", type: "checkbox" }),
   };
   const el = h("div", { class: "section-body" },
     h("div", { class: "grid-2" }, field("Name", inputs.name), field("Location", inputs.location, { hint: "Where it is or who hosts it." })),
     field("Agent URL", inputs.url, { hint: "How the panel reaches the agent. Use https:// for nodes on the internet." }),
+    h("label", { class: "check", style: { marginTop: "-6px" } }, inputs.allow_insecure,
+      h("span", {}, "Allow plain HTTP to an internet address (only if that machine is on a private network or VPN)")),
     field("Public address", inputs.public_host, { hint: "What players type to connect. Shown next to each server's port." }),
     h("div", { class: "grid-2" },
       suffixed("Memory to assign", inputs.memory_mb, "MB", "0 = don't limit. Stops over-committing the machine."),
@@ -93,6 +96,7 @@ function nodeForm(node = {}) {
   const values = () => ({
     name: inputs.name.value.trim(), location: inputs.location.value.trim(), url: inputs.url.value.trim(),
     public_host: inputs.public_host.value.trim(), memory_mb: Number(inputs.memory_mb.value) || 0, disk_mb: Number(inputs.disk_mb.value) || 0,
+    allow_insecure: inputs.allow_insecure.checked,
   });
   return { el, values };
 }
