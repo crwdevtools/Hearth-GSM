@@ -106,6 +106,15 @@ if [[ ! -f .env ]]; then
   say "Saved settings to .env (edit it later to change them)."
 fi
 
+# A .env copied by hand from .env.example has an empty token; Compose would refuse to start.
+if grep -qE '^HEARTH_AGENT_TOKEN=[[:space:]]*$' .env || ! grep -qE '^HEARTH_AGENT_TOKEN=' .env; then
+  say "Generating the agent token in .env"
+  token="$(random_token)"
+  (umask 077 && { grep -vE '^HEARTH_AGENT_TOKEN=' .env; echo "HEARTH_AGENT_TOKEN=$token"; } > .env.tmp)
+  mv .env.tmp .env
+  chmod 600 .env
+fi
+
 port="$(grep -E '^HEARTH_PANEL_PORT=' .env | cut -d= -f2 | tr -d '[:space:]' || true)"
 port="${port:-8000}"
 
@@ -117,17 +126,21 @@ docker compose build --pull || { say "Couldn't check for a newer base image; usi
   || die "Building Hearth failed. The messages above say why."
 docker compose up -d || die "Starting the containers failed. The messages above say why."
 
-say "Waiting for the panel…"
-up() {
-  if command -v curl >/dev/null 2>&1; then curl -fs -o /dev/null "http://localhost:$port/api/auth/state"
-  else wget -q -O /dev/null "http://localhost:$port/api/auth/state"; fi
+state() {  # the panel's /api/auth/state, or nothing if it isn't answering (yet)
+  if command -v curl >/dev/null 2>&1; then curl -fs "http://localhost:$port/api/auth/state"
+  elif command -v wget >/dev/null 2>&1; then wget -q -O - "http://localhost:$port/api/auth/state"
+  else return 2; fi
 }
+say "Waiting for the panel…"
 ready=0
 for _ in $(seq 90); do
-  if up 2>/dev/null; then ready=1; break; fi
+  rc=0; reply="$(state 2>/dev/null)" || rc=$?
+  if [[ $rc == 2 ]]; then ready=2; break; fi  # no curl or wget: can't check, so don't wait
+  if [[ $rc == 0 && -n "$reply" ]]; then ready=1; break; fi
   sleep 2
 done
-[[ $ready == 1 ]] || die "The panel didn't answer within 3 minutes. See what happened with:  docker compose logs panel"
+[[ $ready != 0 ]] || die "The panel didn't answer within 3 minutes. See what happened with:  docker compose logs panel"
+[[ $ready == 2 ]] && echo "(Install curl to have this script wait until the panel is ready.)"
 
 url="http://localhost:$port"
 host="$(grep -E '^HEARTH_PUBLIC_HOST=' .env | cut -d= -f2 || true)"
@@ -137,6 +150,11 @@ say "Hearth is running → $url"
 echo "Game servers are stored in $(grep -E '^HEARTH_DATA_DIR=' .env | cut -d= -f2- || echo /var/lib/hearth)"
 echo "Open game ports in your firewall/router: 25565-25575/tcp (Minecraft Java), 19132/udp (Bedrock), 2456-2457/udp (Valheim)."
 echo "Stop with ./stop.sh   ·   Logs: docker compose logs -f"
+if [[ "${reply:-}" == *'"needs_setup":true'* ]]; then
+  echo
+  say "Next: create your admin account at $url"
+  echo "Do it from this computer or your local network (Hearth only allows the first account from there)."
+fi
 
 if is_mac; then open "$url" >/dev/null 2>&1 || true
 elif [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]] && command -v xdg-open >/dev/null 2>&1; then
