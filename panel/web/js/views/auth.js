@@ -35,6 +35,7 @@ export function renderAuth(root, { needsSetup, setupAllowed = true, onDone }) {
     busy(submit, async () => {
       try {
         await post(needsSetup ? "/auth/setup" : "/auth/login", body);
+        if (needsSetup) location.hash = "/welcome";  // first run: walk the new admin through setup
         onDone();
       } catch (err) {
         if (err.body?.totp_required) {

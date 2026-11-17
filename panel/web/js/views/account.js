@@ -1,6 +1,7 @@
 import { del, get, post } from "../api.js";
 import { h, icon, replace } from "../dom.js";
 import { ago, busy, confirmDialog, copyButton, emptyRow, field, notice, section, toast } from "../ui.js";
+import { currentLanguage, currentTheme, LANGUAGES, setLanguage, setTheme } from "../i18n.js";
 
 export async function renderAccount(root, { me, setCrumbs, refreshMe }) {
   setCrumbs([{ label: "Account" }]);
@@ -8,7 +9,18 @@ export async function renderAccount(root, { me, setCrumbs, refreshMe }) {
     h("div", { class: "page-head" }, h("div", {}, h("h1", {}, me.username),
       h("p", { class: "muted", style: { marginTop: "8px" } }, me.is_admin ? "Administrator"
         : me.max_servers ? `Member · can create up to ${me.max_servers} server${me.max_servers === 1 ? "" : "s"}` : "Member"))),
-    passwordSection(), await twoFactorSection(me, refreshMe), await tokensSection(), sessionsSection());
+    appearanceSection(), passwordSection(), await twoFactorSection(me, refreshMe), await tokensSection(), sessionsSection());
+}
+
+function appearanceSection() {
+  const theme = h("select", { id: "pref-theme" },
+    [["dark", "Dark"], ["light", "Light"], ["system", "Match system"]].map(([v, label]) => h("option", { value: v, selected: currentTheme() === v }, label)));
+  theme.addEventListener("change", () => setTheme(theme.value));
+  const lang = h("select", { id: "pref-lang" },
+    LANGUAGES.map(([v, label]) => h("option", { value: v, selected: currentLanguage() === v }, label)));
+  lang.addEventListener("change", () => setLanguage(lang.value));
+  return section("Appearance", "Saved in this browser.",
+    h("div", { class: "grid-2", style: { maxWidth: "520px" } }, field("Theme", theme), field("Language", lang)));
 }
 
 function sessionsSection() {

@@ -62,10 +62,12 @@ class Template:
     pre_backup: tuple[str, ...] = ()  # console commands that make files consistent for a backup
     post_backup: tuple[str, ...] = ()
     world_folder_var: str | None = None  # variable naming the world folder (for import/export)
+    command_for: Callable[[dict[str, Any]], list[str]] | None = None  # container arguments
 
     def public(self) -> dict[str, Any]:
         data = asdict(self)
         data.pop("image_for", None)
+        data.pop("command_for", None)
         data.pop("fixed_env", None)
         data.pop("env_from_port", None)
         return data
@@ -145,6 +147,23 @@ MC_JAVA_VARIABLES: tuple[Variable, ...] = (
     Variable("LEVEL_TYPE", "World type", "select", "minecraft:normal", "properties",
              options=("minecraft:normal", "minecraft:flat", "minecraft:large_biomes", "minecraft:amplified")),
 )
+
+
+TERRARIA_WORLDS = "/root/.local/share/Terraria/Worlds"
+
+
+def _terraria_command(values: dict[str, Any]) -> list[str]:
+    world = str(values.get("WORLD_NAME") or "World")
+    args = ["-world", f"{TERRARIA_WORLDS}/{world}.wld", "-autocreate", str(values.get("WORLD_SIZE") or 2),
+            "-worldname", world, "-maxplayers", str(values.get("MAX_PLAYERS") or 8),
+            "-difficulty", str(values.get("DIFFICULTY") or 0)]
+    if values.get("PASSWORD"):
+        args += ["-password", str(values["PASSWORD"])]
+    return args
+
+
+_TZ = Variable("TZ", "Time zone", "string", "UTC", "startup", "IANA zone, e.g. America/Toronto.",
+               pattern=r"^[A-Za-z0-9_+\-/]{1,64}$")
 
 
 TEMPLATES: dict[str, Template] = {
@@ -230,6 +249,154 @@ TEMPLATES: dict[str, Template] = {
             min_memory_mb=2048,
             preferred_port=2456,
             stop_timeout=120,
+        ),
+        Template(
+            key="terraria",
+            name="Terraria",
+            game="Terraria",
+            description="TShock Terraria server (vanilla clients can join). Creates the world on first start.",
+            image="ryshe/terraria:latest",
+            data_mount=TERRARIA_WORLDS,
+            ports=(TemplatePort("game", ("tcp",), container_port=7777),),
+            variables=(
+                Variable("WORLD_NAME", "World name", "string", "World", "properties",
+                         "A new world with this name is created if it doesn't exist.", pattern=r"^[A-Za-z0-9_\-]{1,64}$"),
+                Variable("WORLD_SIZE", "World size (new worlds)", "select", "2", "properties", "1 small, 2 medium, 3 large.",
+                         options=("1", "2", "3")),
+                Variable("DIFFICULTY", "Difficulty (new worlds)", "select", "0", "properties",
+                         "0 classic, 1 expert, 2 master, 3 journey.", options=("0", "1", "2", "3")),
+                Variable("MAX_PLAYERS", "Max players", "int", 8, "properties", min=1, max=255),
+                Variable("PASSWORD", "Join password", "string", "", "properties", "Leave empty for none.",
+                         pattern=r"^[^\s]{0,64}$", secret=True),
+            ),
+            default_memory_mb=1536,
+            min_memory_mb=512,
+            preferred_port=7777,
+            stop_timeout=60,
+            command_for=_terraria_command,
+        ),
+        Template(
+            key="factorio",
+            name="Factorio",
+            game="Factorio",
+            description="Headless Factorio server. Settings live in config/server-settings.json (Files tab).",
+            image="factoriotools/factorio:stable",
+            data_mount="/factorio",
+            ports=(TemplatePort("game", ("udp",)),),
+            env_from_port={"PORT": "game"},
+            variables=(
+                Variable("SAVE_NAME", "Save name", "string", "_autosave1", "properties",
+                         "Loaded on start; a new map is generated if it doesn't exist.", pattern=r"^[A-Za-z0-9_\-]{1,64}$"),
+                Variable("GENERATE_NEW_SAVE", "Create the save if missing", "bool", True, "startup"),
+                Variable("LOAD_LATEST_SAVE", "Load the newest save instead", "bool", True, "startup"),
+                Variable("UPDATE_MODS_ON_START", "Update mods on start", "bool", False, "startup",
+                         "Needs USERNAME and TOKEN from your factorio.com profile."),
+                Variable("USERNAME", "factorio.com username", "string", "", "startup", max=64),
+                Variable("TOKEN", "factorio.com token", "string", "", "startup", secret=True, max=64),
+            ),
+            default_memory_mb=2048,
+            min_memory_mb=1024,
+            preferred_port=34197,
+            stop_timeout=60,
+        ),
+        Template(
+            key="palworld",
+            name="Palworld",
+            game="Palworld",
+            description="Palworld dedicated server. Needs a lot of memory (16 GB recommended).",
+            image="thijsvanloef/palworld-server-docker:latest",
+            data_mount="/palworld",
+            ports=(TemplatePort("game", ("udp",)),),
+            env_from_port={"PORT": "game"},
+            variables=(
+                Variable("SERVER_NAME", "Server name", "string", "Hearth Palworld", "properties", max=64),
+                Variable("SERVER_DESCRIPTION", "Description", "string", "", "properties", max=200),
+                Variable("PLAYERS", "Max players", "int", 16, "properties", min=1, max=32),
+                Variable("SERVER_PASSWORD", "Join password", "string", "", "properties", "Leave empty for none.",
+                         secret=True, max=64),
+                Variable("ADMIN_PASSWORD", "Admin password", "string", "", "properties",
+                         "Used by the console (RCON) and in-game admin commands.", secret=True, required=True,
+                         pattern=r"^\S{6,64}$"),
+                Variable("COMMUNITY", "List in the community browser", "bool", False, "properties"),
+                Variable("MULTITHREADING", "Multithreading", "bool", True, "startup"),
+                _TZ,
+            ),
+            default_memory_mb=16384,
+            min_memory_mb=8192,
+            preferred_port=8211,
+            console="exec",
+            console_exec=("rcon-cli",),
+            stop_timeout=60,
+            fixed_env={"PUID": "1000", "PGID": "1000", "RCON_ENABLED": "true"},
+            pre_backup=("save",),
+        ),
+        Template(
+            key="satisfactory",
+            name="Satisfactory",
+            game="Satisfactory",
+            description="Satisfactory dedicated server. Claim it from the game's Server Manager on first join.",
+            image="wolveix/satisfactory-server:latest",
+            data_mount="/config",
+            ports=(TemplatePort("game", ("tcp", "udp")), TemplatePort("messaging", ("tcp",), offset=1)),
+            env_from_port={"SERVERGAMEPORT": "game", "SERVERMESSAGINGPORT": "messaging"},
+            variables=(
+                Variable("MAXPLAYERS", "Max players", "int", 4, "properties", min=1, max=64),
+                Variable("AUTOSAVENUM", "Autosaves to keep", "int", 5, "properties", min=1, max=100),
+                Variable("STEAMBETA", "Experimental branch", "bool", False, "startup"),
+            ),
+            default_memory_mb=12288,
+            min_memory_mb=8192,
+            preferred_port=7777,
+            stop_timeout=120,
+            fixed_env={"PUID": "1000", "PGID": "1000"},
+        ),
+        Template(
+            key="rust",
+            name="Rust",
+            game="Rust",
+            description="Rust dedicated server with web RCON. Three consecutive ports: game, RCON and query.",
+            image="didstopia/rust-server:latest",
+            data_mount="/steamcmd/rust",
+            ports=(TemplatePort("game", ("udp",)), TemplatePort("rcon", ("tcp",), offset=1),
+                   TemplatePort("query", ("udp",), offset=2)),
+            env_from_port={"RUST_SERVER_PORT": "game", "RUST_RCON_PORT": "rcon", "RUST_SERVER_QUERYPORT": "query"},
+            variables=(
+                Variable("RUST_SERVER_NAME", "Server name", "string", "Hearth Rust", "properties", max=64),
+                Variable("RUST_SERVER_DESCRIPTION", "Description", "string", "", "properties", max=200),
+                Variable("RUST_SERVER_MAXPLAYERS", "Max players", "int", 50, "properties", min=1, max=500),
+                Variable("RUST_SERVER_WORLDSIZE", "Map size", "int", 3500, "properties", "In metres (1000–6000).",
+                         min=1000, max=6000),
+                Variable("RUST_SERVER_SEED", "Map seed", "int", 12345, "properties", min=0, max=2147483647),
+                Variable("RUST_RCON_PASSWORD", "RCON password", "string", "", "properties",
+                         "Protects remote admin access.", secret=True, required=True, pattern=r"^\S{8,64}$"),
+                Variable("RUST_OXIDE_ENABLED", "uMod (Oxide) plugins", "bool", False, "startup"),
+            ),
+            default_memory_mb=12288,
+            min_memory_mb=8192,
+            preferred_port=28015,
+            console="exec",
+            console_exec=("rcon",),
+            stop_timeout=180,
+            pre_backup=("server.save",),
+        ),
+        Template(
+            key="velocity",
+            name="Velocity proxy",
+            game="Minecraft",
+            description="Join several Paper servers behind one address. Link them under the proxy's Network tab.",
+            image="itzg/mc-proxy:latest",
+            data_mount="/server",
+            ports=(TemplatePort("game", ("tcp",), container_port=25577),),
+            variables=(
+                Variable("VELOCITY_VERSION", "Velocity version", "string", "latest", "startup",
+                         pattern=r"^[A-Za-z0-9._\-]{1,32}$"),
+            ),
+            default_memory_mb=1024,
+            min_memory_mb=512,
+            preferred_port=25565,
+            stop_timeout=30,
+            features=("proxy",),
+            fixed_env={"TYPE": "VELOCITY"},
         ),
         Template(
             key="custom",

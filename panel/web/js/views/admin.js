@@ -2,7 +2,7 @@
 
 import { del, get, patch, post, put } from "../api.js";
 import { h, icon, replace } from "../dom.js";
-import { busy, bytes, confirmDialog, copyButton, emptyRow, fail, field, mb, notice, section, skeletonRows, suffixed, toast } from "../ui.js";
+import { busy, bytes, confirmDialog, copyButton, download, emptyRow, fail, field, mb, notice, section, skeletonRows, suffixed, toast } from "../ui.js";
 import { activityList } from "./tabs.js";
 
 const SECTIONS = [["overview", "Overview", "layers"], ["nodes", "Nodes", "server"], ["users", "Users", "users"],
@@ -39,8 +39,12 @@ async function overview(root) {
     replace(root);
     overview(root);
   }));
-  root.append(head("Overview", "What this panel manages."),
+  const update = data.update ? notice("info", h("span", {}, `Hearth ${data.update.version} is available (you have ${data.version}). `,
+    data.update.url ? h("a", { class: "link", href: data.update.url, target: "_blank", rel: "noopener noreferrer" }, "What's new") : null,
+    " · Update with git pull, then start.sh or start.bat.")) : null;
+  root.append(head("Overview", "What this panel manages."), update,
     h("dl", { class: "facts", style: { fontSize: "14px" } },
+      h("dt", {}, "Hearth"), h("dd", {}, `Version ${data.version}`),
       h("dt", {}, "Nodes"), h("dd", {}, h("a", { class: "link", href: "#/admin/nodes" }, data.nodes)),
       h("dt", {}, "Servers"), h("dd", {}, h("a", { class: "link", href: "#/" }, data.servers)),
       h("dt", {}, "Users"), h("dd", {}, h("a", { class: "link", href: "#/admin/users" }, data.users)),
@@ -71,7 +75,7 @@ async function nodeList(root, { navigate }) {
     h("td", { class: "figure hide-sm" }, `${mb(n.memory_assigned_mb)} / ${n.memory_mb ? mb(n.memory_mb) : n.system?.memory_total ? bytes(n.system.memory_total) : "—"}`),
     h("td", { class: "figure hide-sm" }, `${n.allocations_free} / ${n.allocations_total}`),
     h("td", { class: "right" }, h("span", { class: "status", "data-state": n.online ? "running" : "node_offline", title: n.error || "" },
-      h("span", { class: "dot" }), n.online ? `Online · Docker ${n.system.docker_version}` : "Unreachable")))));
+      h("span", { class: "dot" }), n.online ? `Online · Docker ${n.system.docker_version}${n.agent_outdated ? " · agent needs updating" : ""}` : "Unreachable")))));
 }
 
 function nodeForm(node = {}) {
@@ -132,6 +136,7 @@ async function nodeDetail(root, { navigate }, id) {
     ? h("span", { class: "status", "data-state": "running" }, h("span", { class: "dot" }), `Online · agent ${node.system.version}`)
     : h("span", { class: "status", "data-state": "node_offline" }, h("span", { class: "dot" }), "Unreachable");
 
+  const outdated = node.agent_outdated ? notice("warn", `This node runs an older agent (${node.system.version}). Some features won't work there until you update it: rebuild or pull the agent image and run the install command again.`) : null;
   const form = nodeForm(node);
   const save = h("button", { class: "btn primary", type: "submit" }, "Save");
   const edit = h("form", {}, h("section", { class: "section" }, h("header", {}, h("h2", {}, "Settings")), form.el),
@@ -194,6 +199,7 @@ async function nodeDetail(root, { navigate }, id) {
   root.append(
     h("div", { class: "page-head" }, h("div", {}, h("h1", {}, node.name),
       h("div", { class: "meta" }, status, h("span", { class: "mono", style: { fontSize: "13px" } }, node.url), node.location ? h("span", {}, node.location) : null))),
+    outdated,
     h("section", { class: "section" }, h("header", {}, h("h2", {}, "System")), h("div", { class: "section-body" }, system)),
     h("section", { class: "section" },
       h("header", {}, h("h2", {}, "Ports"), h("p", {}, `${node.allocations_free} of ${node.allocations_total} free. Servers take ports from this pool; open them in the machine's firewall too.`)),
@@ -322,6 +328,7 @@ async function settings(root) {
   const interval = h("input", { id: "upd", type: "number", min: 15, max: 10080, step: 15, value: s.update_interval_minutes });
   const zones = typeof Intl.supportedValuesOf === "function" ? Intl.supportedValuesOf("timeZone") : [];
   const tz = h("input", { id: "tz", class: "mono", value: s.timezone, list: "tz-list", autocomplete: "off" });
+  const alertHook = h("input", { id: "alert-hook", class: "mono", value: s.alerts_discord_webhook || "", placeholder: "https://discord.com/api/webhooks/…", autocomplete: "off" });
   const save = h("button", { class: "btn primary", type: "submit" }, "Save");
   const clearKey = s.curseforge_api_key_set && !s.curseforge_from_env ? h("button", { class: "btn ghost", type: "button" }, "Remove key") : null;
   clearKey?.addEventListener("click", () => busy(clearKey, async () => {
@@ -339,13 +346,16 @@ async function settings(root) {
       h("header", {}, h("h2", {}, "Modpack updates"), h("p", {}, "How often Hearth looks for new modpack releases. Servers with auto-update on restart onto them, after a safety backup.")),
       h("div", { class: "section-body", style: { maxWidth: "260px" } }, suffixed("Check every", interval, "min", "15 minutes to 7 days."))),
     h("section", { class: "section" },
+      h("header", {}, h("h2", {}, "Alerts"), h("p", {}, "Crashes and crash loops, failed backups, servers near their disk limit, and nodes going offline or running low on disk are posted to this Discord channel, for every server.")),
+      h("div", { class: "section-body", style: { maxWidth: "560px" } }, field("Discord webhook", alertHook, { hint: "Channel settings → Integrations → Webhooks. Leave empty to turn off." }))),
+    h("section", { class: "section" },
       h("header", {}, h("h2", {}, "Time zone"), h("p", {}, "Scheduled tasks run on this clock.")),
       h("div", { class: "section-body", style: { maxWidth: "320px" } }, field("Time zone", tz, { hint: "e.g. America/Toronto" }),
         h("datalist", { id: "tz-list" }, zones.map((z) => h("option", { value: z }))))),
     h("div", { class: "form-foot" }, save));
   form.addEventListener("submit", (e) => {
     e.preventDefault();
-    const body = { update_interval_minutes: Number(interval.value), timezone: tz.value.trim() };
+    const body = { update_interval_minutes: Number(interval.value), timezone: tz.value.trim(), alerts_discord_webhook: alertHook.value.trim() };
     if (key.value.trim()) body.curseforge_api_key = key.value.trim();
     busy(save, async () => {
       await put("/admin/settings", body);
@@ -353,7 +363,76 @@ async function settings(root) {
       replace(root); settings(root);
     });
   });
-  root.append(head("Settings"), form, await webhooksSection());
+  root.append(head("Settings"), form, await offsiteSection(), await panelBackupSection(), await webhooksSection());
+}
+
+async function offsiteSection() {
+  const body = h("div", { class: "section-body" });
+  const draw = async () => {
+    const o = await get("/admin/offsite");
+    const inp = (id, value, extra = {}) => h("input", { id, class: "mono", value, autocomplete: "off", ...extra });
+    const endpoint = inp("s3-endpoint", o.endpoint, { placeholder: "https://s3.us-west-002.backblazeb2.com", required: true });
+    const region = inp("s3-region", o.region, { placeholder: "us-east-1" });
+    const bucket = inp("s3-bucket", o.bucket, { placeholder: "my-hearth-backups", required: true });
+    const access = inp("s3-access", o.access_key, { required: true });
+    const secret = h("input", { id: "s3-secret", type: "password", class: "mono", autocomplete: "off",
+      placeholder: o.secret_set ? "Saved — paste to replace" : "", required: !o.secret_set });
+    const prefix = inp("s3-prefix", o.prefix, { placeholder: "hearth/" });
+    const pathStyle = h("input", { type: "checkbox", checked: o.path_style });
+    const save = h("button", { class: "btn primary", type: "submit" }, o.configured ? "Test and save" : "Test and turn on");
+    const off = o.configured ? h("button", { class: "btn ghost", type: "button" }, "Turn off") : null;
+    off?.addEventListener("click", () => busy(off, async () => {
+      if (!(await confirmDialog({ title: "Turn off off-site copies?", body: "New backups stay on their node only. Copies already in storage are left there.", confirm: "Turn off" }))) return;
+      await put("/admin/offsite", { endpoint: "" }); toast("Off-site copies turned off."); draw();
+    }));
+    const form = h("form", { class: "grid-2" },
+      field("Endpoint", endpoint, { hint: "Any S3-compatible storage: AWS S3, Backblaze B2, Cloudflare R2, Wasabi, MinIO…" }),
+      field("Region", region, { hint: "auto for Cloudflare R2." }),
+      field("Bucket", bucket), field("Folder in the bucket", prefix),
+      field("Access key ID", access), field("Secret access key", secret),
+      h("label", { class: "check" }, pathStyle, h("span", {}, "Path-style addressing (needed for MinIO; works with most providers)")),
+      h("div", { class: "cell-flex", style: { gridColumn: "1 / -1" } }, save, off));
+    form.addEventListener("submit", (e) => {
+      e.preventDefault();
+      busy(save, async () => {
+        const out = { endpoint: endpoint.value.trim(), region: region.value.trim(), bucket: bucket.value.trim(),
+          access_key: access.value.trim(), prefix: prefix.value.trim(), path_style: pathStyle.checked };
+        if (secret.value.trim()) out.secret_key = secret.value.trim();
+        await put("/admin/offsite", out);
+        toast("Storage works. New backups are copied there.");
+        draw();
+      });
+    });
+    replace(body,
+      o.configured ? notice("info", "On. Every finished backup is copied here, and deleted from here when it's deleted or pruned.") : null,
+      form);
+  };
+  await draw();
+  return section("Off-site backups", "Keep a second copy of every backup somewhere else, so a dead disk or a stolen PC doesn't take your worlds with it. Nodes only get short-lived upload links; the keys stay in the panel.", body);
+}
+
+async function panelBackupSection() {
+  const body = h("div", { class: "section-body" });
+  const draw = async () => {
+    const d = await get("/admin/panel-backups");
+    if (!d.supported) return replace(body, h("p", { class: "muted" }, "The panel uses PostgreSQL; back it up with pg_dump."));
+    const now = h("button", { class: "btn", type: "button" }, icon("archive"), "Back up now");
+    now.addEventListener("click", () => busy(now, async () => {
+      const r = await post("/admin/panel-backups");
+      toast(r.offsite ? "Panel backed up (and copied off-site)." : "Panel backed up.");
+      draw();
+    }));
+    const rows = d.backups.map((b) => {
+      const dl = h("button", { class: "btn sm ghost icon-only", type: "button", title: "Download", "aria-label": `Download ${b.name}` }, icon("arrowdown"));
+      dl.addEventListener("click", () => download(`/api/admin/panel-backups/${encodeURIComponent(b.name)}`));
+      return h("tr", {}, h("td", { class: "mono" }, b.name), h("td", { class: "figure right" }, bytes(b.size)), h("td", { class: "right" }, dl));
+    });
+    replace(body,
+      h("div", { class: "toolbar" }, now),
+      h("table", { class: "table" }, h("tbody", {}, rows.length ? rows : emptyRow(3, "The first nightly copy is made a few minutes after the panel starts."))));
+  };
+  await draw();
+  return section("Panel database", "Users, servers, schedules and settings are copied every night (the last 14 are kept, and copied off-site when that's on). To restore one, stop the panel and replace data/hearth.db with it.", body);
 }
 
 async function webhooksSection() {

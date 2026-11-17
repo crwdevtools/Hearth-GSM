@@ -96,6 +96,11 @@ export async function renderCreate(root, { query, navigate, setCrumbs, me }) {
   let vars = null;
   const eula = h("input", { type: "checkbox" });
   const start = h("input", { type: "checkbox", checked: true });
+  const presetList = await get("/presets").catch(() => []);
+  const starter = h("select", { id: "starter" }, h("option", { value: "" }, "None"),
+    presetList.map((p) => h("option", { value: p.key }, `${p.name} (${p.software.map((x) => x[0] + x.slice(1).toLowerCase()).join("/")})`)));
+  const starterHint = h("span", { class: "hint" }, "Plugins or mods installed from Modrinth before the first start.");
+  starter.addEventListener("change", () => replace(starterHint, presetList.find((p) => p.key === starter.value)?.description || "Plugins or mods installed from Modrinth before the first start."));
 
   function onTemplate() {
     memory.value = template.default_memory_mb;
@@ -106,7 +111,8 @@ export async function renderCreate(root, { query, navigate, setCrumbs, me }) {
       source = sourceEditor({ initial: prefillPack ? { kind: "modpack", modpack: prefillPack, auto_update: true } : { kind: "software" } });
       replace(sourceSection,
         h("header", {}, h("h2", {}, "Source"), h("p", {}, "Run plain Minecraft at any version, or install a modpack. Hearth picks the right Java for it.")),
-        source.el);
+        source.el,
+        presetList.length ? h("div", { class: "field", style: { maxWidth: "420px", marginTop: "16px" } }, h("label", { for: "starter" }, "Starter pack"), starter, starterHint) : null);
       sourceSection.hidden = false;
     } else {
       source = null;
@@ -173,6 +179,13 @@ export async function renderCreate(root, { query, navigate, setCrumbs, me }) {
       if (!s) return toast("Choose a modpack, or switch back to server software.", "warn");
       if (s.kind === "software") Object.assign(body.variables, { TYPE: s.server_type, VERSION: s.version });
       else Object.assign(body, { modpack: s.modpack, auto_update: s.auto_update });
+      if (starter.value) {
+        const p = presetList.find((x) => x.key === starter.value);
+        if (s.kind !== "software" || !p.software.includes(s.server_type)) {
+          return toast(`${p.name} needs ${p.software.map((x) => x[0] + x.slice(1).toLowerCase()).join(" or ")} as the server software.`, "warn");
+        }
+        body.preset = starter.value;
+      }
     }
     busy(submit, async () => {
       const created = await post("/servers", body);

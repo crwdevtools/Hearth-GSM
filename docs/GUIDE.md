@@ -166,6 +166,10 @@ rebuild if the code changed, and start whatever isn't running.
 The first time you open the panel it asks you to **create the admin account**. That account
 can do everything. Other people get their own accounts from you later ([section 11](#11-users-sharing-quotas-and-suspension)).
 
+Right after, a short **setup wizard** asks for your time zone, shows whether your machine is
+online and how many ports are free, and offers the optional Discord alerts webhook and
+CurseForge key. Every step can be skipped; it's all in Admin later (the wizard is at `#/welcome`).
+
 Until that account exists, anyone who can reach the panel could claim it. So Hearth only accepts
 it **from the computer running Hearth or your local network**. If you're setting up a cloud
 server and can only reach it over the internet, either use an SSH tunnel
@@ -193,7 +197,9 @@ You'll find:
 - **Your name** (top right): your account page, with password, two-factor sign-in and API tokens.
 
 A node called **local** is already set up, with ports **25565–25575** (Minecraft Java),
-**19132** (Bedrock) and **2456–2457** (Valheim).
+**19132** (Bedrock), **2456–2457** (Valheim), **7777–7779** (Terraria, Satisfactory),
+**34197** (Factorio), **8211** (Palworld) and **28015–28017** (Rust). Panels set up before
+version 0.2.0 can add the new ones under Admin → Nodes → the node → **Add ports**.
 
 ![Admin → Nodes](images/nodes.png)
 
@@ -215,7 +221,22 @@ The owner sees the server and has full control of it.
 | Minecraft: Java Edition | `itzg/minecraft-server` | 25565/tcp | 1 GB |
 | Minecraft: Bedrock Edition | `itzg/minecraft-bedrock-server` | 19132/udp | 512 MB |
 | Valheim | `lloesche/valheim-server` | 2456–2457/udp | 2 GB |
+| Terraria (TShock) | `ryshe/terraria` | 7777/tcp | 512 MB |
+| Factorio | `factoriotools/factorio` | 34197/udp | 1 GB |
+| Palworld | `thijsvanloef/palworld-server-docker` | 8211/udp | 8 GB |
+| Satisfactory | `wolveix/satisfactory-server` | 7777/tcp+udp and 7778/tcp | 8 GB |
+| Rust | `didstopia/rust-server` | 28015/udp, 28016/tcp (RCON), 28017/udp (query) | 8 GB |
+| Velocity proxy | `itzg/mc-proxy` | 25565/tcp | 512 MB |
 | Custom Docker image (admins only) | any | any | 128 MB |
+
+**Starter pack** (Minecraft Java, optional): **Java + Bedrock (Geyser)** on Paper or Purpur
+installs Geyser and Floodgate and gives the server port 19132/udp so Bedrock players can join;
+**Fabric performance pack** installs Lithium, FerriteCore, Krypton and ModernFix.
+
+**Velocity proxy**: create it, start it once (so Velocity writes `velocity.toml`), then tick
+the Paper or Purpur servers to put behind it on the proxy's **Network** tab. Hearth turns on
+modern forwarding with a shared secret and switches the backends to proxy-only, so players
+can't skip the proxy. Players land on the first server you ticked.
 
 **Source** (Minecraft Java):
 - **Software**: Vanilla, Paper, Purpur (plugins), Fabric, Quilt, Forge or NeoForge (mods).
@@ -260,6 +281,11 @@ example `say hello` or `op Steve`. On the right are live **CPU, memory, disk, ne
 
 Typing `stop` in the console stops the server and keeps it stopped, just like the Stop button.
 
+**Search** (above the output) shows only the lines containing what you type, with the match
+marked; Esc goes back to the live view. **Up and Down** walk through the commands you've sent,
+and that history is remembered in your browser. For Minecraft Java, **latest.log** downloads the
+full log since the last start, and **Crash reports** opens the `crash-reports` folder.
+
 ### Files
 
 A file manager for the server's folder:
@@ -280,6 +306,10 @@ A file manager for the server's folder:
 Who's online right now, the **whitelist**, **operators** and **banned players**, with buttons
 to whitelist, op/deop, kick (with a reason), ban and unban. Player heads come from mc-heads.net.
 The server must be running for these actions, because they're sent as console commands.
+
+**Last 30 days** lists every player's playtime, number of sessions and when they were last
+seen, plus how many played and the most that were online at once. Hearth checks who's online
+once a minute while the server runs, so times are accurate to about a minute.
 
 ### Mods (Minecraft Java with Paper, Purpur, Fabric, Quilt, Forge, NeoForge or a modpack)
 
@@ -306,6 +336,15 @@ to load changes.
 
 Crash reports, caches, heap dumps and old compressed logs are skipped to keep backups small.
 Backups are stored on the same machine as the server ([section 16](#16-where-your-data-lives)).
+
+**Off-site copies.** In Admin → Settings → **Off-site backups**, enter any S3-compatible storage:
+endpoint (for example `https://s3.us-west-002.backblazeb2.com`, or
+`https://<account>.r2.cloudflarestorage.com` with region `auto`), bucket, access key and secret.
+Hearth writes, reads back and deletes a test file before saving, so a typo shows up right away.
+From then on every finished backup is uploaded there (big ones in 128 MB parts). The storage keys
+stay in the panel: nodes only get upload links that expire. Backups show **Off-site** once
+copied; a failed copy shows why and has a retry button. Deleting or pruning a backup deletes its
+off-site copy. If a node loses its disk, **Get from off-site** downloads the copy back.
 
 ### Schedules
 
@@ -387,6 +426,11 @@ edited, backups, crashes and out-of-memory kills, updates, schedule results.
   - **Reinstall** re-creates the container from the current settings. Files are kept.
   - **Make a copy** creates a copy of the server on its own port, with or without its files. The
     original saves first, so the copy is consistent. Use it to test an update or new mods.
+  - **Pause for maintenance** (1 minute to 7 days): schedules, modpack auto-updates, auto-sleep
+    and crash-loop handling wait until it ends, so they don't get in the way while you work.
+  - **Move to another node** (admins): the server is stopped and backed up, copied to the other
+    machine through the panel, restored there and started again if it was running. If anything
+    fails, it stays where it was. It gets new ports, so share the new address.
   - **Suspend** (admins) stops the server and blocks anyone but an admin from starting it.
   - **Delete** removes the server, its files and its backups. This can't be undone.
 
@@ -501,6 +545,14 @@ when the server:
 started · stopped · crashed · ran out of memory · went to sleep · woke up · was created ·
 deleted · suspended · unsuspended · has a modpack update available · updated its modpack ·
 finished a backup · failed a backup · was restored · had a scheduled task fail.
+
+### Admin alerts (all servers)
+
+Admin → Settings → **Alerts** takes one Discord webhook for problems anywhere in the panel:
+crashes and out-of-memory, **crash loops** (3 crashes in 10 minutes: Hearth stops the server so
+it doesn't keep restarting), a server reaching **90% and 100% of its disk limit**, failed
+backups and off-site copies, failed scheduled tasks, and a machine going **offline**, coming
+back, or running **low on disk** (under 10% or 5 GB free).
 
 ### Webhooks (panel-wide)
 
@@ -749,7 +801,13 @@ Hearth has no payment provider built in, but it has the pieces to connect one:
 ### In the panel (Admin → Settings)
 
 CurseForge API key · time zone for schedules · how often to check for modpack updates ·
+the admin **Alerts** Discord webhook · **Off-site backups** · the **Panel database** backups ·
 webhooks. The **Check modpack updates now** button is on Admin → Overview.
+
+### In your browser (Account → Appearance)
+
+Theme (dark, light or match the system) and language (English or Français). Both are remembered
+in that browser. Messages that come from the server, and console output, stay in English.
 
 ---
 
@@ -765,7 +823,10 @@ HEARTH_DATA_DIR/
 ```
 
 The panel's database (users, servers, schedules, settings, activity) lives in the Docker volume
-`panel-data`. To back up the panel itself, copy that volume:
+`panel-data`. Hearth copies it **every night** to `panel-backups/` in that volume (the last 14
+are kept, and uploaded to off-site storage when that's set up). Admin → Settings → **Panel
+database** lists them, makes one on demand, and downloads them. To restore one, stop the panel
+and replace `hearth.db` with it. To copy the whole volume yourself:
 
 ```sh
 docker run --rm -v hearth-gsm_panel-data:/data -v "$PWD":/out alpine tar czf /out/panel-data.tgz -C /data .
@@ -776,8 +837,8 @@ The volume name starts with the folder name of your checkout; `docker volume ls`
 **Moving game files to another drive:** stop your servers and Hearth, move the
 `HEARTH_DATA_DIR` folder, update the line in `.env`, and start again.
 
-**Backups live on the same machine as the server.** For protection against a dead disk,
-download important backups, or copy `backups/` somewhere else regularly.
+**Backups live on the same machine as the server** unless off-site copies are on
+([section 6, Backups](#backups)).
 
 ---
 
@@ -886,12 +947,15 @@ properties forms are generated from those variables.
 ## 20. Known limitations
 
 - **No SFTP.** Use the file manager, or access the server folders on the machine directly.
-- **Disk limits** are shown and tracked, not enforced: Docker can't cap a folder's size.
-- **Backups stay on the server's machine.** Copy important ones elsewhere.
+- **Disk limits** block uploads, mod installs and unpacking archives once reached, and warn at
+  90%. The game itself can still write past the limit (Docker can't cap a folder's size); you get
+  an alert when it does.
+- **Moving a server** takes only its newest state: older backups that weren't copied off-site
+  stay on the old machine. It gets new ports on the new machine.
+- **Velocity backends** on the same machine are reached at `172.17.0.1` (Docker's default
+  bridge). If your Docker uses a different bridge address, edit `velocity.toml`.
+- **Translations** cover the interface text; server messages and logs stay in English.
 - **No built-in payments.** Use the API and webhooks ([section 14](#14-api-tokens-and-webhooks)).
-- **Mod dependencies:** installing a mod installs its required dependencies even if a different
-  version of one is already present. Check `mods/` for duplicates if a server won't start
-  after installing mods.
 - **Database upgrades are additive** (new tables and columns). A future change that renames or
   removes columns would need a proper migration tool.
 - **Player management, auto-sleep, wake-on-join and the join check** are for Minecraft Java.

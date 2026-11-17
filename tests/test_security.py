@@ -192,3 +192,39 @@ def test_plain_sign_out_still_leaves_other_sessions_alone(admin):
     admin.post("/api/auth/logout")
     admin.cookies.set("hearth_session", other)
     assert admin.get("/api/servers").status_code == 200
+
+
+def test_versions_match_everywhere():
+    import re
+    from pathlib import Path
+
+    from hearth_agent import VERSION as agent_version
+    from hearth_panel import VERSION as panel_version
+
+    assert panel_version == agent_version
+    changelog = (Path(__file__).resolve().parent.parent / "CHANGELOG.md").read_text()
+    assert re.search(rf"^## {re.escape(panel_version)}$", changelog, re.M), "add a CHANGELOG section for this version"
+
+
+def test_update_notice_and_outdated_agents(admin, node, public, agent):
+    from hearth_panel.services import release
+
+    public.latest_release = {"tag_name": "v9.0.0", "html_url": "https://github.com/x/y/releases/v9.0.0"}
+    assert admin.get("/api/admin/overview").json()["update"]["version"] == "9.0.0"
+    assert release.parse("v0.10.0") > release.parse("0.9.3")
+    nodes = admin.get("/api/nodes").json()
+    assert nodes[0]["agent_outdated"] is False
+
+
+def test_older_agents_are_flagged(admin, node, agent, monkeypatch):
+    import httpx
+
+    original = agent.__class__.__call__
+
+    def old_agent(self, request):
+        if request.url.path == "/api/system":
+            return httpx.Response(200, json={"version": "0.1.0", "docker_version": "27"})
+        return original(self, request)
+
+    monkeypatch.setattr(agent.__class__, "__call__", old_agent)
+    assert admin.get("/api/nodes").json()[0]["agent_outdated"] is True

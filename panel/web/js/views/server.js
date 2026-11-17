@@ -25,7 +25,7 @@ const TABS = [
   ["settings", "Settings", "gear"],
 ];
 
-export async function renderServer(root, { params, me, navigate, setCrumbs }) {
+export async function renderServer(root, { params, query, me, navigate, setCrumbs }) {
   const id = Number(params[0]);
   let server;
   try {
@@ -46,6 +46,7 @@ export async function renderServer(root, { params, me, navigate, setCrumbs }) {
   const ctx = {
     server: () => server,
     me,
+    query: query || new URLSearchParams(),
     navigate,
     onStatus: (fn) => listeners.add(fn),
     async reload() {
@@ -116,7 +117,7 @@ function header(ctx) {
     const st = s.status.state;
     // Status arrives every 2 s; only rebuild when something visible changed, so buttons keep
     // focus and in-flight clicks.
-    const signature = JSON.stringify([s.name, s.address, st, s.status.error, s.status.restarts, s.modpack?.update?.id, s.modpack?.name, s.template.name, s.suspended]);
+    const signature = JSON.stringify([s.name, s.address, st, s.status.error, s.status.restarts, s.modpack?.update?.id, s.modpack?.name, s.template.name, s.suspended, s.moving, s.maintenance_until]);
     if (signature === shown) return;
     shown = signature;
     replace(title, s.name);
@@ -142,11 +143,14 @@ function header(ctx) {
       }));
       buttons.push(btn);
     }
-    if (!s.permissions.includes("power")) buttons.length = 0;
+    if (!s.permissions.includes("power") || s.moving) buttons.length = 0;
     replace(actions, buttons);
     const err = s.status.error;
     replace(alert,
       s.suspended ? notice("bad", h("span", {}, h("strong", {}, "Suspended. "), s.suspended_reason || "An admin suspended this server; it can't be started.")) : null,
+      s.moving ? notice("info", h("span", {}, h("strong", {}, "Moving to another node. "), `${s.moving}…`)) : null,
+      s.maintenance_until ? notice("info", h("span", {}, h("strong", {}, "Paused for maintenance "), `until ${new Date(s.maintenance_until).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}. Schedules, auto-updates, auto-sleep and crash handling wait until then.`)) : null,
+      s.disk_mb && (s.status.disk || 0) >= s.disk_mb * 1048576 ? notice("bad", h("span", {}, h("strong", {}, "At its disk limit. "), "Uploads and mod installs are blocked. Delete old files or ask an admin to raise the limit.")) : null,
       st === "sleeping" ? notice("info", h("span", {}, h("strong", {}, "Sleeping. "), "Nobody was playing, so it stopped to free memory. It wakes up when someone tries to join (they rejoin a minute later), or press Start.")) : null,
       st === "restoring" ? notice("info", "Restoring a backup. The server comes back automatically when it's done.") : null,
       st === "installing" ? notice("info", "Pulling the image and creating the container. Large images and modpacks can take a few minutes.") : null,
@@ -213,8 +217,18 @@ async function consoleTab(panel, ctx) {
   const input = h("input", { "aria-label": "Console command", placeholder: "Type a command…", autocomplete: "off", spellcheck: "false" });
   const jump = h("button", { class: "btn sm jump", type: "button" }, icon("arrowdown"), "Latest");
   const stats = h("dl", { class: "stats" });
+  const found = h("pre", { class: "console-found", hidden: true, "aria-label": "Matching console lines", tabindex: "0" });
+  const search = h("input", { type: "search", class: "console-search", placeholder: "Search output…", "aria-label": "Search console output", spellcheck: "false" });
+  const count = h("span", { class: "faint console-count", "aria-live": "polite" });
+  const logs = isJava(s)
+    ? [h("button", { class: "btn sm ghost", type: "button", title: "Download logs/latest.log (includes everything since the last start)",
+      onclick: () => download(`/api/servers/${s.id}/files/download?path=${encodeURIComponent("/logs/latest.log")}`) }, icon("arrowdown"), "latest.log"),
+    h("a", { class: "btn sm ghost", href: `#/servers/${s.id}/files?path=${encodeURIComponent("/crash-reports")}`, title: "Open the crash-reports folder" }, icon("file"), "Crash reports")]
+    : [];
   panel.append(h("div", { class: "console-grid" },
-    h("div", { class: "console" }, out, jump,
+    h("div", { class: "console" },
+      h("div", { class: "console-bar" }, icon("search"), search, count, h("span", { class: "grow" }), ...logs),
+      out, found, jump,
       h("form", { class: "console-in", onsubmit: (e) => { e.preventDefault(); send(); } },
         h("span", { class: "prompt", "aria-hidden": "true" }, "›"), input,
         h("button", { class: "btn sm ghost", type: "submit" }, "Send"))),
@@ -264,7 +278,34 @@ async function consoleTab(panel, ctx) {
       range.deleteContents();
     }
     if (stick) out.scrollTop = out.scrollHeight;
+    if (search.value.trim()) { clearTimeout(searchTimer); searchTimer = setTimeout(runSearch, 400); }
   }
+  // ----- search: show only the matching lines, with the match marked -------------------------
+  function runSearch() {
+    const q = search.value.trim().toLowerCase();
+    found.hidden = !q;
+    out.hidden = !!q;
+    jump.hidden = !!q;
+    if (!q) { replace(count); return; }
+    const lines = out.textContent.split("\n").filter((l) => l.toLowerCase().includes(q));
+    replace(count, `${lines.length} ${lines.length === 1 ? "line" : "lines"}`);
+    replace(found, lines.length ? lines.slice(-2000).flatMap((l) => {
+      const parts = [];
+      let at = 0;
+      const low = l.toLowerCase();
+      for (let i = low.indexOf(q); i >= 0; i = low.indexOf(q, at)) {
+        parts.push(l.slice(at, i), h("mark", {}, l.slice(i, i + q.length)));
+        at = i + q.length;
+      }
+      parts.push(l.slice(at), "\n");
+      return parts;
+    }) : h("span", { class: "sys" }, "No lines match."));
+    found.scrollTop = found.scrollHeight;
+  }
+  let searchTimer = 0;
+  search.addEventListener("input", () => { clearTimeout(searchTimer); searchTimer = setTimeout(runSearch, 120); });
+  search.addEventListener("keydown", (e) => { if (e.key === "Escape") { search.value = ""; runSearch(); input.focus(); } });
+
   function clearConsole() {
     pending = [];
     carry = "";
@@ -299,8 +340,12 @@ async function consoleTab(panel, ctx) {
   let closed = false;
   let retry = 0;
   let retryTimer = null;
-  const history = [];
+  // Command history survives reloads (per server, in this browser). Up/Down walk through it.
+  const historyKey = `hearth.console.${s.id}`;
+  let history = [];
+  try { history = JSON.parse(localStorage.getItem(historyKey) || "[]").filter((x) => typeof x === "string").slice(0, 100); } catch { history = []; }
   let historyIndex = -1;
+  let draft = "";
 
   let reconnected = false;
   function connect() {
@@ -339,20 +384,22 @@ async function consoleTab(panel, ctx) {
     }
     ws.send(JSON.stringify({ type: "command", data: command }));
     write(`› ${command}\n`, "echo");
-    history.unshift(command);
-    history.length = Math.min(history.length, 50);
+    if (history[0] !== command) history.unshift(command);
+    history.length = Math.min(history.length, 100);
+    try { localStorage.setItem(historyKey, JSON.stringify(history)); } catch { /* private mode: keep it in memory */ }
     historyIndex = -1;
     input.value = "";
     stick = true;
   }
   input.addEventListener("keydown", (e) => {
     if (e.key === "ArrowUp" && history.length) {
+      if (historyIndex === -1) draft = input.value;
       historyIndex = Math.min(history.length - 1, historyIndex + 1);
       input.value = history[historyIndex];
       e.preventDefault();
-    } else if (e.key === "ArrowDown") {
-      historyIndex = Math.max(-1, historyIndex - 1);
-      input.value = historyIndex >= 0 ? history[historyIndex] : "";
+    } else if (e.key === "ArrowDown" && historyIndex >= 0) {
+      historyIndex -= 1;
+      input.value = historyIndex >= 0 ? history[historyIndex] : draft;
       e.preventDefault();
     }
   });
@@ -371,7 +418,8 @@ async function consoleTab(panel, ctx) {
 
 async function filesTab(panel, ctx) {
   const s = ctx.server();
-  let path = "/";
+  const start = ctx.query.get("path") || "/";
+  let path = /^\/[^\0]*$/.test(start) && !start.split("/").includes("..") ? start : "/";
   const bar = h("div", { class: "pathbar" });
   const tbody = h("tbody", {});
   const body = h("div", {});
@@ -467,7 +515,9 @@ async function filesTab(panel, ctx) {
           h("button", { class: "btn sm ghost icon-only", type: "button", title: "Delete", "aria-label": `Delete ${e.name}`, onclick: (ev) => { ev.stopPropagation(); remove(full, e); } }, icon("trash")))));
       }));
     } catch (err) {
-      replace(tbody, h("tr", {}, h("td", { colspan: 4 }, notice("bad", err.message))));
+      replace(tbody, h("tr", {}, h("td", { colspan: 4 }, err.status === 404 && path !== "/"
+        ? h("span", { class: "muted" }, "This folder doesn't exist yet. ", h("button", { class: "link", type: "button", onclick: () => open("/") }, "Back to the server folder"))
+        : notice("bad", err.message))));
     }
   }
 
@@ -527,7 +577,7 @@ async function filesTab(panel, ctx) {
     } catch (err) { fail(err); }
   }
 
-  await open("/");
+  await open(path);
 }
 
 // ----- software (Minecraft Java) ----------------------------------------------------------------
@@ -692,8 +742,42 @@ async function networkTab(panel, ctx) {
           h("div", { class: "table-wrap" }, h("table", { class: "board" },
             h("thead", {}, h("tr", {}, h("th", {}, "Address"), h("th", { class: "hide-sm" }, "Bind IP"), h("th", {}, "Role"), h("th", {}, h("span", { class: "sr-only" }, "Actions")))),
             h("tbody", {}, rows))))));
+    if (s.template.key === "velocity" && s.permissions.includes("settings")) panel.append(proxySection(s));
   };
   draw();
+}
+
+function proxySection(s) {
+  const body = h("div", { class: "section-body" }, h("p", { class: "muted" }, "Loading…"));
+  const load = async () => {
+    let d;
+    try { d = await get(`/servers/${s.id}/proxy`); } catch (err) { return replace(body, notice("bad", err.message)); }
+    if (!d.servers.length) return replace(body, h("p", { class: "muted" }, "No Paper or Purpur servers to link yet. Create one, then come back."));
+    const order = d.servers.filter((x) => x.linked).map((x) => x.id);
+    const boxes = d.servers.map((x) => {
+      const box = h("input", { type: "checkbox", checked: x.linked, disabled: x.other_proxy });
+      box.addEventListener("change", () => {
+        const i = order.indexOf(x.id);
+        if (box.checked && i < 0) order.push(x.id);
+        if (!box.checked && i >= 0) order.splice(i, 1);
+      });
+      return h("label", { class: "check" }, box, h("span", {}, x.name,
+        h("small", {}, `${x.node} · ${x.address}${x.other_proxy ? " · behind another proxy" : ""}`)));
+    });
+    const save = h("button", { class: "btn primary", type: "button" }, "Save and restart");
+    save.addEventListener("click", () => busy(save, async () => {
+      await put(`/servers/${s.id}/proxy`, { backends: order });
+      await post(`/servers/${s.id}/power`, { action: "restart" }).catch(() => {});
+      toast("Linked. Restart the backend servers too if they were running.");
+      load();
+    }));
+    replace(body,
+      h("p", { class: "hint" }, "Ticked servers join the proxy, in the order you tick them (players land on the first one). Hearth turns on Velocity's modern forwarding and switches each backend to proxy-only, so nobody can skip the proxy."),
+      h("div", { style: { display: "grid", gap: "10px" } }, boxes),
+      h("div", {}, save));
+  };
+  load();
+  return h("section", { class: "section" }, h("header", {}, h("h2", {}, "Backend servers"), h("p", {}, "Which servers players reach through this proxy.")), body);
 }
 
 // ----- settings ---------------------------------------------------------------------------------
@@ -816,6 +900,38 @@ async function settingsTab(panel, ctx) {
     await ctx.reload();
     ctx.navigate(`/servers/${s.id}/settings`);
   }));
+  const pause = canSettings ? h("button", { class: "btn", type: "button" }, icon("clock"), s.maintenance_until ? "End maintenance pause" : "Pause for maintenance") : null;
+  pause?.addEventListener("click", () => busy(pause, async () => {
+    if (s.maintenance_until) {
+      await post(`/servers/${s.id}/maintenance`, { minutes: 0 });
+      toast("Maintenance pause ended.");
+    } else {
+      const minutes = await promptDialog({ title: "Pause for maintenance", label: "For how many minutes?", value: "60", confirm: "Pause",
+        hint: "Schedules, modpack auto-updates, auto-sleep and crash-loop handling hold off until then." });
+      if (minutes === null) return;
+      const n = Math.round(Number(minutes));
+      if (!(n >= 1 && n <= 10080)) return toast("Enter 1 to 10080 minutes.", "bad");
+      await post(`/servers/${s.id}/maintenance`, { minutes: n });
+      toast(`Paused for ${n} minutes.`);
+    }
+    await ctx.reload();
+    ctx.navigate(`/servers/${s.id}/settings`);
+  }));
+  const moveBtn = admin ? h("button", { class: "btn", type: "button", disabled: !!s.moving }, icon("server"), "Move to another node") : null;
+  moveBtn?.addEventListener("click", () => busy(moveBtn, async () => {
+    const nodes = (await get("/nodes")).filter((n) => n.id !== s.node.id);
+    if (!nodes.length) return toast("Add another node first (Admin → Nodes).", "bad");
+    const select = h("select", { id: "move-node" }, nodes.map((n) => h("option", { value: n.id }, n.name)));
+    const ok = await confirmDialog({ title: `Move ${s.name}?`, confirm: "Move",
+      body: h("div", { style: { display: "grid", gap: "12px" } },
+        h("p", {}, "The server stops, is backed up, copied to the new node and restored there, then starts again if it was running. It gets new ports on the new node, so players need the new address."),
+        h("p", { class: "muted" }, "Older backups stay on the current node (ones with an off-site copy can be fetched later)."),
+        field("New node", select)) });
+    if (!ok) return;
+    await post(`/servers/${s.id}/move`, { node_id: Number(select.value) });
+    toast("Moving. This page shows progress.");
+    await ctx.reload();
+  }));
   const remove = isOwner && (admin || me.max_servers > 0) ? h("button", { class: "btn danger", type: "button" }, icon("trash"), "Delete server") : null;
   remove?.addEventListener("click", () => busy(remove, async () => {
     const ok = await confirmDialog({ title: `Delete ${s.name}?`, body: "The container, every file on the node (worlds included) and its backups are deleted. This can't be undone.", confirm: "Delete forever", danger: true, typeToConfirm: s.name });
@@ -846,7 +962,7 @@ async function settingsTab(panel, ctx) {
     h("section", { class: "section" },
       h("header", {}, h("h2", {}, "Maintenance"), clone ? h("p", {}, "A copy gets its own port and starts stopped: a safe place to try updates or mods.") : null),
       h("div", { class: "section-body" },
-        h("div", { class: "toolbar", style: { margin: 0 } }, reinstall, clone, suspend, remove),
+        h("div", { class: "toolbar", style: { margin: 0 } }, reinstall, clone, pause, moveBtn, suspend, remove),
         h("dl", { class: "facts" },
           h("dt", {}, "Server ID"), h("dd", {}, s.uuid),
           h("dt", {}, "Template"), h("dd", {}, s.template.key),

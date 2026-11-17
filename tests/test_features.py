@@ -284,8 +284,8 @@ def test_plugin_install_includes_required_dependency(admin, node, agent):
     found = admin.get(f"/api/servers/{sid}/mods/search").json()
     assert found["target"]["kind"] == "plugin" and found["target"]["folder"] == "/plugins"
     r = admin.post(f"/api/servers/{sid}/mods", json={"project_id": "PLUGIN01"})
-    assert r.json()["installed"] == ["plugin01.jar", "dep00001.jar"]
-    assert {f["path"] for f in agent.fetched} == {"/plugins/plugin01.jar", "/plugins/dep00001.jar"}
+    assert r.json()["installed"] == ["plugin01-1.jar", "dep00001-1.jar"]
+    assert {f["path"] for f in agent.fetched} == {"/plugins/plugin01-1.jar", "/plugins/dep00001-1.jar"}
 
 
 def test_vanilla_cannot_take_mods(admin, node):
@@ -795,3 +795,479 @@ async def test_auto_sleep_uses_the_motd_and_auto_stop_is_announced_once(admin, n
     await monitor.tick(now=1200.0)
     log = admin.get(f"/api/servers/{sid2}/activity").json()
     assert [e["action"] for e in log].count("server.stopped") == 1
+
+
+
+# ----- mods: duplicates and modpack updates ---------------------------------------------------------
+
+
+def test_dependency_already_present_is_not_installed_twice(admin, node, agent, public):
+    sid = _create(admin, node)["id"]
+    uuid = admin.get(f"/api/servers/{sid}").json()["uuid"]
+    old_dep = public.mod_file("DEP00001", 1)
+    public.mod_versions["DEP00001"] = 2  # a newer dependency exists, but an older one is installed
+    agent.jars[uuid] = {"SomeLibrary-renamed.jar": old_dep["sha512"]}
+    r = admin.post(f"/api/servers/{sid}/mods", json={"project_id": "PLUGIN01"}).json()
+    assert r["installed"] == ["plugin01-1.jar"] and r["already_installed"] == ["SomeLibrary-renamed.jar"]
+    assert sorted(agent.jars[uuid]) == ["SomeLibrary-renamed.jar", "plugin01-1.jar"]  # no second copy
+
+
+def test_reinstalling_a_mod_replaces_the_old_version(admin, node, agent, public):
+    sid = _create(admin, node)["id"]
+    uuid = admin.get(f"/api/servers/{sid}").json()["uuid"]
+    admin.post(f"/api/servers/{sid}/mods", json={"project_id": "PLUGIN01"})
+    again = admin.post(f"/api/servers/{sid}/mods", json={"project_id": "PLUGIN01"}).json()
+    assert again["installed"] == [] and "plugin01-1.jar" in again["already_installed"]
+    public.mod_versions["PLUGIN01"] = 2
+    admin.post(f"/api/servers/{sid}/mods", json={"project_id": "PLUGIN01"})
+    assert sorted(agent.jars[uuid]) == ["dep00001-1.jar", "plugin01-2.jar"]
+    listed = {f["name"]: f for f in admin.get(f"/api/servers/{sid}/mods").json()["installed"]}
+    assert listed["plugin01-2.jar"]["added"] and listed["dep00001-1.jar"]["dependency"]
+    admin.delete(f"/api/servers/{sid}/mods/plugin01-2.jar")
+    assert not any(f["added"] for f in admin.get(f"/api/servers/{sid}/mods").json()["installed"])
+
+
+@pytest.mark.anyio
+async def test_your_mods_come_back_after_a_modpack_update_removes_them(admin, node, agent, public, monkeypatch):
+    from hearth_panel.services import mods
+
+    sid = _create(admin, node)["id"]  # a Paper server stands in: the restore logic is the same
+    uuid = admin.get(f"/api/servers/{sid}").json()["uuid"]
+    admin.post(f"/api/servers/{sid}/mods", json={"project_id": "PLUGIN01"})
+    agent.jars[uuid] = {}  # the update wiped the folder
+    agent.state, agent.power = "running", []
+    monkeypatch.setattr(mods, "RESTORE_POLL", 0.01)
+    restored = await mods._restore(admin.app.state.ctx, sid)
+    assert sorted(restored) == ["dep00001-1.jar", "plugin01-1.jar"]
+    assert agent.power[-1][1] == "restart"
+    log = admin.get(f"/api/servers/{sid}/activity").json()
+    assert log[0]["action"] == "mods.restored"
+    agent.power = []
+    assert await mods._restore(admin.app.state.ctx, sid) == [] and agent.power == []  # nothing missing now
+
+
+# ----- off-site copies ---------------------------------------------------------------------------
+
+S3 = {"endpoint": "https://s3.test", "region": "us-east-1", "bucket": "hearth-backups",
+      "access_key": "AKTEST", "secret_key": "shh", "prefix": "home/", "path_style": True}
+
+
+@pytest.fixture
+def fast_offsite(monkeypatch):
+    from hearth_panel.services import offsite
+
+    monkeypatch.setattr(offsite, "POLL", 0.01)
+
+
+def _wait_offsite(client, sid, want="done"):
+    import time
+
+    for _ in range(300):
+        rows = client.get(f"/api/servers/{sid}/backups").json()
+        if rows and all(r["offsite"] == want for r in rows):
+            return rows
+        time.sleep(0.02)
+    raise AssertionError(rows)
+
+
+def test_offsite_settings_are_tested_before_saving(admin, public):
+    assert admin.get("/api/admin/offsite").json()["configured"] is False
+    r = admin.put("/api/admin/offsite", json={**S3, "access_key": "WRONG"})
+    assert r.status_code == 400 and "InvalidAccessKeyId" in r.json()["detail"]
+    assert admin.get("/api/admin/offsite").json()["configured"] is False
+    r = admin.put("/api/admin/offsite", json={**S3, "bucket": "Not_Valid"})
+    assert r.status_code == 400 and "bucket" in r.json()["detail"]
+
+    out = admin.put("/api/admin/offsite", json=S3).json()
+    assert out["configured"] and out["secret_set"] and "secret_key" not in out
+    assert public.s3 == {}  # the test file was cleaned up
+    # Changing the bucket without re-entering the secret keeps the saved secret.
+    assert admin.put("/api/admin/offsite", json={"bucket": "other-bucket"}).json()["bucket"] == "other-bucket"
+    assert admin.put("/api/admin/offsite", json={"endpoint": ""}).json()["configured"] is False
+
+
+def test_backups_are_copied_off_site_and_deleted_with_them(admin, node, agent, public, fast_offsite):
+    admin.put("/api/admin/offsite", json=S3)
+    sid = _create(admin, node)["id"]
+    admin.post(f"/api/servers/{sid}/backups", json={"name": "Nightly"})
+    _wait_backups(admin, sid)
+    row = _wait_offsite(admin, sid)[0]
+    uuid = admin.get(f"/api/servers/{sid}").json()["uuid"]
+    [key] = public.s3
+    assert key.startswith(f"/hearth-backups/home/{uuid}/") and public.s3[key] == b"tar-bytes"
+
+    # The node lost its copy: pull it back from storage.
+    agent.backups.clear()
+    assert admin.post(f"/api/servers/{sid}/backups/{row['id']}/fetch").status_code == 202
+    assert _wait_backups(admin, sid)[0]["size"] == len(b"tar-bytes")
+    assert len(agent.pushed) == 1  # fetching back doesn't upload it again
+
+    assert admin.delete(f"/api/servers/{sid}/backups/{row['id']}").status_code == 204
+    assert public.s3 == {}
+
+
+def test_big_backups_upload_in_parts(admin, node, agent, public, fast_offsite, monkeypatch):
+    from hearth_panel.services import s3
+
+    monkeypatch.setattr(s3, "SINGLE_PUT_LIMIT", 1000)
+    monkeypatch.setattr(s3, "PART_SIZE", 2000)  # 4096-byte fake backup -> 3 parts
+    admin.put("/api/admin/offsite", json=S3)
+    sid = _create(admin, node)["id"]
+    admin.post(f"/api/servers/{sid}/backups", json={"name": "Big"})
+    _wait_offsite(admin, sid)
+    assert list(public.s3.values()) == [b"part1part2part3"] and public.s3_parts == {}
+
+
+def test_offsite_failure_is_reported_and_can_be_retried(admin, node, agent, public, fast_offsite):
+    admin.put("/api/admin/offsite", json=S3)
+    public.s3_down = True
+    sid = _create(admin, node)["id"]
+    admin.post(f"/api/servers/{sid}/backups", json={"name": "Nightly"})
+    _wait_backups(admin, sid)
+    row = _wait_offsite(admin, sid, "failed")[0]
+    assert "503" in row["offsite_error"]
+    assert any(e["action"] == "backup.offsite_failed" for e in admin.get(f"/api/servers/{sid}/activity").json())
+    public.s3_down = False
+    assert admin.post(f"/api/servers/{sid}/backups/{row['id']}/offsite").status_code == 202
+    _wait_offsite(admin, sid)
+
+
+def test_backups_without_offsite_storage_stay_local(admin, node, agent, fast_offsite):
+    sid = _create(admin, node)["id"]
+    admin.post(f"/api/servers/{sid}/backups", json={"name": "Local"})
+    row = _wait_backups(admin, sid)[0]
+    assert row["offsite"] is None and agent.pushed == []
+    assert admin.post(f"/api/servers/{sid}/backups/{row['id']}/offsite").status_code == 409
+    assert admin.post(f"/api/servers/{sid}/backups/{row['id']}/fetch").status_code == 409
+
+
+def test_panel_database_backups(admin, public):
+    assert admin.get("/api/admin/panel-backups").json() == {"supported": True, "backups": []}
+    admin.put("/api/admin/offsite", json=S3)
+    made = admin.post("/api/admin/panel-backups").json()
+    assert made["offsite"] is True
+    assert any(k.endswith(made["name"]) and "/home/panel/" in k for k in public.s3)
+    [listed] = admin.get("/api/admin/panel-backups").json()["backups"]
+    data = admin.get(f"/api/admin/panel-backups/{listed['name']}").content
+    assert data.startswith(b"SQLite format 3")
+    assert admin.get("/api/admin/panel-backups/..%2Ftest.db").status_code == 404
+
+
+# ----- health alerts, maintenance ----------------------------------------------------------------
+
+HOOK = "https://discord.com/api/webhooks/1/alerts"
+
+
+@pytest.mark.anyio
+async def test_crash_loops_are_stopped_and_alerted(admin, node, agent, public):
+    import asyncio
+
+    r = admin.put("/api/admin/settings", json={"alerts_discord_webhook": "https://example.com/x"})
+    assert r.status_code == 400
+    assert admin.put("/api/admin/settings", json={"alerts_discord_webhook": HOOK}).json()["alerts_discord_webhook"] == HOOK
+    sid = _create(admin, node)["id"]
+    monitor = admin.app.state.monitor
+    agent.state = "running"
+    for n in range(4):
+        agent.status_extra = {"restarts": n}
+        await monitor.tick(now=n * 60.0)
+    await asyncio.sleep(0.05)
+    actions = [e["action"] for e in admin.get(f"/api/servers/{sid}/activity").json()]
+    assert actions.count("server.crashed") == 3 and "server.crash_loop" in actions
+    assert agent.power[-1][1] == "stop"
+    titles = [body["embeds"][0]["title"] for url, body in public.posts if url == HOOK]
+    assert any("keeps crashing" in t for t in titles)
+
+
+@pytest.mark.anyio
+async def test_maintenance_pauses_crash_handling_and_schedules(admin, node, agent):
+    scheduler = admin.app.state.scheduler
+    sid = _create(admin, node)["id"]
+    s = admin.post(f"/api/servers/{sid}/maintenance", json={"minutes": 60}).json()
+    assert s["maintenance_until"]
+    monitor = admin.app.state.monitor
+    agent.state = "running"
+    for n in range(4):
+        agent.status_extra = {"restarts": n}
+        await monitor.tick(now=n * 60.0)
+    assert ("stop" not in [a for _, a in agent.power])
+    sched = admin.post(f"/api/servers/{sid}/schedules", json={"name": "r", "cron": "0 4 * * *", "action": "restart"}).json()
+    assert (await scheduler.execute(sched["id"])).startswith("Skipped: server is paused")
+    assert admin.post(f"/api/servers/{sid}/maintenance", json={"minutes": 0}).json()["maintenance_until"] is None
+
+
+@pytest.mark.anyio
+async def test_disk_limit_warnings_are_announced_once_per_step(admin, node, agent):
+    sid = _create(admin, node, disk_mb=1000)["id"]
+    monitor = admin.app.state.monitor
+    for disk_mb in (500, 920, 930, 1001, 1002, 700, 950):
+        agent.status_extra = {"disk": disk_mb * 1048576}
+        await monitor.tick(now=0)
+    actions = [e["action"] for e in admin.get(f"/api/servers/{sid}/activity").json()]
+    assert actions.count("server.disk_warning") == 2 and actions.count("server.disk_full") == 1
+    assert agent.specs[admin.get(f"/api/servers/{sid}").json()["uuid"]]["disk_mb"] == 1000
+
+
+@pytest.mark.anyio
+async def test_node_offline_low_disk_and_recovery_alerts(admin, node, agent, public):
+    import asyncio
+
+    admin.put("/api/admin/settings", json={"alerts_discord_webhook": HOOK})
+    monitor = admin.app.state.monitor
+    agent.online = False
+    await monitor.tick(now=0)
+    await monitor.tick(now=61)
+    await monitor.tick(now=122)  # announced once
+    agent.online, agent.disk_free = True, 2 << 30
+    await monitor.tick(now=183)
+    await monitor.tick(now=244)
+    await asyncio.sleep(0.05)
+    log = [e["action"] for e in admin.get("/api/admin/activity").json()["items"]] if isinstance(
+        admin.get("/api/admin/activity").json(), dict) else [e["action"] for e in admin.get("/api/admin/activity").json()]
+    assert log.count("node.offline") == 1 and log.count("node.online") == 1 and log.count("node.disk_low") == 1
+    titles = [body["embeds"][0]["title"] for url, body in public.posts if url == HOOK]
+    assert "Node Home is offline" in titles and "Node Home is low on disk space" in titles
+
+
+# ----- moving servers between nodes --------------------------------------------------------------
+
+
+@pytest.fixture
+def second_node(admin, agent, fast_moves):
+    import httpx
+
+    from conftest import FakeAgent
+
+    other = FakeAgent()
+    other.storage = agent.storage
+    routes = {"agent": agent, "agent2": other}
+    admin.app.state.ctx.nodes.http._transport = httpx.MockTransport(lambda r: routes[r.url.host](r))
+    r = admin.post("/api/nodes", json={"name": "Garage", "location": "Garage", "url": "http://agent2:8080",
+                                       "public_host": "garage.example.net"})
+    nid = r.json()["id"]
+    admin.post(f"/api/nodes/{nid}/allocations", json={"ports": "30000-30005"})
+    return {"id": nid, "agent": other}
+
+
+@pytest.fixture
+def fast_moves(monkeypatch):
+    from hearth_panel.services import moves
+
+    monkeypatch.setattr(moves, "POLL", 0.01)
+
+
+def _wait_moved(client, sid):
+    import time
+
+    for _ in range(300):
+        s = client.get(f"/api/servers/{sid}").json()
+        if not s["moving"]:
+            return s
+        time.sleep(0.02)
+    raise AssertionError(s)
+
+
+def test_moving_a_server_to_another_node(admin, node, agent, second_node):
+    sid = _create(admin, node)["id"]
+    uuid = admin.get(f"/api/servers/{sid}").json()["uuid"]
+    admin.post(f"/api/servers/{sid}/backups", json={"name": "Old"})
+    _wait_backups(admin, sid)
+    agent.state = "running"
+    r = admin.post(f"/api/servers/{sid}/move", json={"node_id": second_node["id"]})
+    assert r.status_code == 202 and r.json()["moving"]
+    assert admin.post(f"/api/servers/{sid}/power", json={"action": "start"}).status_code == 409
+    agent.state = "offline"  # it stopped
+    s = _wait_moved(admin, sid)
+    other = second_node["agent"]
+    assert s["node"]["id"] == second_node["id"] and s["allocations"][0]["port"] == 30000
+    assert uuid in other.specs and uuid not in agent.specs
+    assert other.received and other.restored == list(other.received)
+    assert ("stop" in [a for _, a in agent.power]) and ("start" in [a for _, a in other.power])
+    rows = {b["name"]: b for b in admin.get(f"/api/servers/{sid}/backups").json()}
+    assert rows["Old"]["state"] == "failed" and "Left on Home" in rows["Old"]["error"]
+    assert rows["Move to Garage"]["state"] == "ready" and rows["Move to Garage"]["kind"] == "move"
+    actions = [e["action"] for e in admin.get(f"/api/servers/{sid}/activity").json()]
+    assert "server.moved" in actions
+    # The old node's ports are free again.
+    assert all(a["server_id"] is None for a in admin.get(f"/api/nodes/{node['id']}").json()["allocations"])
+
+
+def test_failed_move_puts_the_server_back(admin, node, agent, second_node):
+    sid = _create(admin, node)["id"]
+    uuid = admin.get(f"/api/servers/{sid}").json()["uuid"]
+    second_node["agent"].online = False
+    assert admin.post(f"/api/servers/{sid}/move", json={"node_id": second_node["id"]}).status_code == 202
+    s = _wait_moved(admin, sid)
+    assert s["node"]["id"] == node["id"] and s["allocations"][0]["port"] == 25565 and uuid in agent.specs
+    log = admin.get(f"/api/servers/{sid}/activity").json()
+    assert any(e["action"] == "server.move_failed" and "Still on Home" in e["detail"] for e in log)
+    assert admin.post(f"/api/servers/{sid}/move", json={"node_id": node["id"]}).status_code == 409
+
+
+def test_uploads_through_the_panel_reach_the_node(admin, node, agent):
+    sid = _create(admin, node)["id"]
+    r = admin.put(f"/api/servers/{sid}/files/upload", params={"path": "/plugins/x.jar"}, content=b"jar-bytes")
+    assert r.status_code == 204, r.text
+    assert agent.files["/plugins/x.jar"] == "jar-bytes"
+
+
+# ----- new games, presets ------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("key,ports", [("terraria", [(7777, "tcp")]), ("factorio", [(34197, "udp")]),
+                                       ("palworld", [(8211, "udp")]), ("velocity", [(25565, "tcp")])])
+def test_new_game_templates_build_specs(admin, node, agent, key, ports):
+    nid = node["id"]
+    admin.post(f"/api/nodes/{nid}/allocations", json={"ports": "7777-7779,34197,8211,28015-28017"})
+    variables = {"palworld": {"ADMIN_PASSWORD": "hunter22"}}.get(key, {})
+    r = admin.post("/api/servers", json={"name": key, "node_id": nid, "template": key, "memory_mb": 8192,
+                                         "variables": variables, "start": False})
+    assert r.status_code in (200, 201), r.text
+    spec = agent.specs[r.json()["uuid"]]
+    assert [(p["host_port"], p["protocol"]) for p in spec["ports"]] == ports
+    if key == "terraria":
+        assert spec["command"][:2] == ["-world", "/root/.local/share/Terraria/Worlds/World.wld"]
+        assert spec["ports"][0]["container_port"] == 7777
+    if key == "factorio":
+        assert spec["env"]["PORT"] == "34197"
+    if key == "velocity":
+        assert spec["env"]["TYPE"] == "VELOCITY" and spec["ports"][0]["container_port"] == 25577
+
+
+def test_rust_and_satisfactory_claim_consecutive_ports(admin, node, agent):
+    nid = node["id"]
+    admin.post(f"/api/nodes/{nid}/allocations", json={"ports": "7777-7778,28015-28017"})
+    rust = admin.post("/api/servers", json={"name": "r", "node_id": nid, "template": "rust", "memory_mb": 12288,
+                                            "variables": {"RUST_RCON_PASSWORD": "longenough"}, "start": False}).json()
+    env = agent.specs[rust["uuid"]]["env"]
+    assert (env["RUST_SERVER_PORT"], env["RUST_RCON_PORT"], env["RUST_SERVER_QUERYPORT"]) == ("28015", "28016", "28017")
+    sat = admin.post("/api/servers", json={"name": "s", "node_id": nid, "template": "satisfactory", "memory_mb": 12288,
+                                           "start": False}).json()
+    env = agent.specs[sat["uuid"]]["env"]
+    assert (env["SERVERGAMEPORT"], env["SERVERMESSAGINGPORT"]) == ("7777", "7778")
+    assert admin.post("/api/servers", json={"name": "p", "node_id": nid, "template": "palworld", "memory_mb": 16384,
+                                            "start": False}).status_code == 400  # admin password required
+
+
+def test_geyser_preset_installs_plugins_and_bedrock_port(admin, node, agent):
+    nid = node["id"]
+    admin.post(f"/api/nodes/{nid}/allocations", json={"ports": "19132"})
+    assert [p["key"] for p in admin.get("/api/presets").json()] == ["geyser", "fabric-performance"]
+    r = admin.post("/api/servers", json={"name": "Cross", "node_id": nid, "template": "minecraft-java", "memory_mb": 4096,
+                                         "accept_eula": True, "variables": {"TYPE": "PAPER", "VERSION": "1.21.4"},
+                                         "preset": "geyser", "start": True})
+    assert r.status_code in (200, 201), r.text
+    out = r.json()
+    assert out["warning"] is None
+    assert sorted(f["path"] for f in agent.fetched) == ["/plugins/flood001-1.jar", "/plugins/geyser01-1.jar"]
+    assert 19132 in [a["port"] for a in out["allocations"]]
+    assert (out["uuid"], "start") in agent.power
+    mods_listed = admin.get(f"/api/servers/{out['id']}/mods").json()
+    assert {m.get("added") for m in mods_listed.get("installed", mods_listed if isinstance(mods_listed, list) else [])} <= {True, None, False}
+
+    r = admin.post("/api/servers", json={"name": "Nope", "node_id": nid, "template": "minecraft-java", "memory_mb": 4096,
+                                         "accept_eula": True, "variables": {"TYPE": "FABRIC"}, "preset": "geyser"})
+    assert r.status_code == 400 and "Paper" in r.json()["detail"]
+
+
+def test_fabric_preset_warns_without_bedrock_port_issue(admin, node, agent):
+    r = admin.post("/api/servers", json={"name": "Fast", "node_id": node["id"], "template": "minecraft-java",
+                                         "memory_mb": 4096, "accept_eula": True,
+                                         "variables": {"TYPE": "FABRIC", "VERSION": "1.21.4"}, "preset": "fabric-performance"})
+    assert r.status_code in (200, 201), r.text
+    assert len(agent.fetched) == 4 and all(f["path"].startswith("/mods/") for f in agent.fetched)
+
+
+VELOCITY_TOML = """config-version = "2.7"
+bind = "0.0.0.0:25577"
+player-info-forwarding-mode = "NONE"
+
+[servers]
+lobby = "127.0.0.1:30066"
+try = ["lobby"]
+
+[forced-hosts]
+"lobby.example.com" = ["lobby"]
+"""
+
+
+def test_velocity_links_paper_backends_with_modern_forwarding(admin, node, agent):
+    nid = node["id"]
+    proxy = admin.post("/api/servers", json={"name": "Proxy", "node_id": nid, "template": "velocity", "memory_mb": 1024,
+                                             "start": False}).json()
+    paper = _create(admin, node, name="Survival", variables={"TYPE": "PAPER"})
+    fabric = _create(admin, node, name="Modded", variables={"TYPE": "FABRIC"})
+    r = admin.put(f"/api/servers/{proxy['id']}/proxy", json={"backends": [paper["id"]]})
+    assert r.status_code == 409 and "Start the proxy once" in r.json()["detail"]
+
+    agent.files["/velocity.toml"] = VELOCITY_TOML
+    listed = admin.get(f"/api/servers/{proxy['id']}/proxy").json()["servers"]
+    assert [s["name"] for s in listed] == ["Survival"]  # Fabric can't do Paper's forwarding
+    assert admin.put(f"/api/servers/{proxy['id']}/proxy", json={"backends": [fabric["id"]]}).status_code == 400
+
+    r = admin.put(f"/api/servers/{proxy['id']}/proxy", json={"backends": [paper["id"]]})
+    assert r.status_code == 200, r.text
+    toml = agent.files["/velocity.toml"]
+    port = paper["allocations"][0]["port"]
+    assert f'survival = "172.17.0.1:{port}"' in toml and 'try = ["survival"]' in toml and "lobby =" not in toml
+    assert 'player-info-forwarding-mode = "modern"' in toml and '"lobby.example.com"' in toml
+    secret = agent.files["/forwarding.secret"]
+    paper_cfg = agent.files["/config/paper-global.yml"]
+    assert "enabled: true" in paper_cfg and secret in paper_cfg
+    assert agent.specs[paper["uuid"]]["env"]["ONLINE_MODE"] == "false"
+
+    assert admin.put(f"/api/servers/{proxy['id']}/proxy", json={"backends": []}).status_code == 200
+    assert agent.specs[paper["uuid"]]["env"]["ONLINE_MODE"] == "true"
+    assert "enabled: false" in agent.files["/config/paper-global.yml"]
+
+
+def test_paper_global_yaml_edit_keeps_other_settings():
+    from hearth_panel.services.proxy import set_paper_velocity
+
+    text = ("_version: 29\nproxies:\n  bungee-cord:\n    online-mode: true\n  velocity:\n    enabled: false\n"
+            "    online-mode: false\n    secret: ''\nscoreboards:\n  save-empty: true\n")
+    out = set_paper_velocity(text, True, "s3cr'et")
+    assert "    enabled: true\n    online-mode: true\n    secret: 's3cr''et'" in out
+    assert "bungee-cord:\n    online-mode: true" in out and out.endswith("scoreboards:\n  save-empty: true\n")
+    assert set_paper_velocity("", True, "x") == "proxies:\n  velocity:\n    enabled: true\n    online-mode: true\n    secret: 'x'\n"
+
+
+# ----- player stats ------------------------------------------------------------------------------
+
+
+def test_playtime_sessions_and_peaks(admin, node, agent):
+    from datetime import datetime, timedelta, timezone
+
+    from hearth_panel.models import Server
+    from hearth_panel.services import playtime
+
+    sid = _create(admin, node)["id"]
+    t0 = datetime(2026, 11, 10, 18, 0, tzinfo=timezone.utc)
+    with admin.app.state.ctx.db.sessionmaker() as db:
+        server = db.get(Server, sid)
+        playtime.observe(db, server, ["alex"], t0)
+        playtime.observe(db, server, ["alex", "sam"], t0 + timedelta(minutes=30))
+        playtime.observe(db, server, ["sam"], t0 + timedelta(hours=1))
+        playtime.observe(db, server, None, t0 + timedelta(hours=2))  # server stopped
+        playtime.observe(db, server, ["alex"], t0 + timedelta(days=1))
+        out = playtime.stats(db, server, 30, now=t0 + timedelta(days=1, minutes=10))
+    assert out["unique_players"] == 2 and out["peak"] == 2
+    by = {p["name"]: p for p in out["players"]}
+    assert by["alex"]["seconds"] == 3600 + 600 and by["alex"]["sessions"] == 2 and by["alex"]["online"]
+    assert by["sam"]["seconds"] == 5400 and not by["sam"]["online"]
+    assert [d["peak"] for d in out["daily_peak"]] == [2, 1]
+    assert admin.get(f"/api/servers/{sid}/players/stats").json()["unique_players"] == 2
+
+
+@pytest.mark.anyio
+async def test_monitor_records_who_is_online(admin, node, agent):
+    sid = _create(admin, node)["id"]
+    monitor = admin.app.state.monitor
+    agent.state, agent.command_output = "running", "There are 1 of a max of 20 players online: alex"
+    await monitor.tick(now=0)
+    await monitor.tick(now=15)
+    stats = admin.get(f"/api/servers/{sid}/players/stats").json()
+    assert [p["name"] for p in stats["players"]] == ["alex"] and stats["players"][0]["online"]
+    agent.state = "offline"
+    await monitor.tick(now=30)
+    assert not admin.get(f"/api/servers/{sid}/players/stats").json()["players"][0]["online"]

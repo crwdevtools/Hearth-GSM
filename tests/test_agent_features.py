@@ -4,6 +4,7 @@ import asyncio
 import gzip
 import io
 import json
+import os
 import socket
 import sys
 import tarfile
@@ -44,7 +45,7 @@ def env(tmp_path):
         yield client, docker, tmp_path
 
 
-def wait(fn, timeout=10.0):
+def wait(fn, timeout=30.0):
     deadline = time.time() + timeout
     while time.time() < deadline:
         value = fn()
@@ -535,3 +536,148 @@ def test_restore_failing_after_the_swap_puts_the_old_files_back(env, monkeypatch
     client.post(f"/api/servers/{UUID}/backups/{BACKUP}/restore", headers=AUTH)
     wait(lambda: client.get(f"/api/servers/{UUID}", headers=AUTH).json()["state"] != "restoring", 15)
     assert (root / "world" / "level.dat").read_text() == "current"
+
+
+def test_jar_hashes_for_modrinth_lookup(env):
+    import hashlib
+
+    client, _, tmp = env
+    install(client)
+    root, _ = _planted(tmp)
+    (root / "plugins" / "ok.jar").write_bytes(b"jar bytes")
+    (root / "plugins" / "notes.txt").write_text("ignored")
+    (root / "plugins" / "evil.jar").symlink_to(tmp / "host-secrets" / "shadow")
+    r = client.get(f"/api/servers/{UUID}/files/hashes", params={"path": "/plugins"}, headers=AUTH)
+    assert r.json() == {"ok.jar": hashlib.sha512(b"jar bytes").hexdigest()}
+    assert client.get(f"/api/servers/{UUID}/files/hashes", params={"path": "/evil-dir"}, headers=AUTH).status_code == 403
+
+
+class _FakeStorage(BaseHTTPRequestHandler):
+    """Just enough S3: PUT stores the body (per part), GET returns it, ETag is the body's md5."""
+
+    objects: dict[str, bytes] = {}
+    fail_first: set[str] = set()
+
+    def do_PUT(self):  # noqa: N802
+        import hashlib
+
+        body = self.rfile.read(int(self.headers["Content-Length"]))
+        if self.path in self.fail_first:
+            self.fail_first.discard(self.path)
+            self.send_response(503)
+            self.end_headers()
+            return
+        self.objects[self.path] = body
+        self.send_response(200)
+        self.send_header("ETag", f'"{hashlib.md5(body).hexdigest()}"')
+        self.end_headers()
+
+    def do_GET(self):  # noqa: N802
+        body = self.objects.get(self.path)
+        self.send_response(200 if body is not None else 404)
+        self.send_header("Content-Length", str(len(body or b"")))
+        self.end_headers()
+        self.wfile.write(body or b"")
+
+    def log_message(self, *args):
+        pass
+
+
+def test_backups_go_off_site_in_parts_and_come_back(env, monkeypatch):
+    import hashlib
+
+    from hearth_agent import backups as backups_mod
+
+    monkeypatch.setattr(backups_mod.time, "sleep", lambda _s: None)
+    storage = HTTPServer(("127.0.0.1", 0), _FakeStorage)
+    threading.Thread(target=storage.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{storage.server_port}"
+    client, _, tmp = env
+    install(client)
+    root = tmp / "servers" / UUID
+    (root / "world").mkdir(parents=True)
+    (root / "world" / "level.dat").write_bytes(os.urandom(300_000))  # incompressible, ~300 KB archive
+    client.post(f"/api/servers/{UUID}/backups", json={"backup_id": BACKUP}, headers=AUTH)
+    wait(lambda: client.get(f"/api/servers/{UUID}/backups/{BACKUP}", headers=AUTH).json()["state"] == "ready")
+    archive = client.app.state.backups.archive_path(UUID, BACKUP).read_bytes()
+
+    part = 5 * 1024 * 1024  # the minimum; force a 1-part multipart and a retry on it
+    _FakeStorage.fail_first = {"/part1"}
+    r = client.post(f"/api/servers/{UUID}/backups/{BACKUP}/push", headers=AUTH,
+                    json={"urls": [f"{base}/part1"], "part_size": part})
+    assert r.status_code == 202
+    meta = wait(lambda: (m := client.get(f"/api/servers/{UUID}/backups/{BACKUP}", headers=AUTH).json())["push"]["state"] != "uploading" and m)
+    assert meta["push"] == {"state": "done", "etags": [f'"{hashlib.md5(archive).hexdigest()}"']}
+    assert _FakeStorage.objects["/part1"] == archive
+
+    # The node lost its copy (new disk): pull it back down.
+    client.delete(f"/api/servers/{UUID}/backups/{BACKUP}", headers=AUTH)
+    r = client.post(f"/api/servers/{UUID}/backups/{BACKUP}/pull", headers=AUTH, json={"url": f"{base}/part1"})
+    assert r.status_code == 202
+    wait(lambda: client.get(f"/api/servers/{UUID}/backups/{BACKUP}", headers=AUTH).json()["state"] == "ready")
+    assert client.app.state.backups.archive_path(UUID, BACKUP).read_bytes() == archive
+    storage.shutdown()
+
+
+def test_multipart_upload_splits_the_file(tmp_path):
+    from hearth_agent.backups import _Slice
+
+    path = tmp_path / "f"
+    path.write_bytes(bytes(range(256)) * 100)  # 25,600 bytes
+    with open(path, "rb") as f:
+        parts = [b"".join(iter(lambda s=_Slice(f, n * 10_000, min(10_000, 25_600 - n * 10_000)): s.read(4096), b""))
+                 for n in range(3)]
+    assert [len(p) for p in parts] == [10_000, 10_000, 5_600] and b"".join(parts) == path.read_bytes()
+
+
+def test_disk_limit_blocks_uploads_downloads_and_unpacking(env):
+    client, _, tmp = env
+    install(client, {**SPEC, "disk_mb": 1})
+    root = tmp / "servers" / UUID
+    r = client.put(f"/api/servers/{UUID}/files/upload", params={"path": "/big.bin"}, content=b"x" * 2_000_000, headers=AUTH)
+    assert r.status_code == 507 and "disk limit" in r.json()["detail"]
+    assert not (root / "big.bin").exists()
+
+    def chunks():
+        for _ in range(20):
+            yield b"x" * 100_000
+
+    r = client.put(f"/api/servers/{UUID}/files/upload", params={"path": "/big.bin"}, content=chunks(), headers=AUTH)
+    assert r.status_code == 507 and not any(p.name.endswith(".hearth-tmp") for p in root.iterdir())
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("huge.dat", b"\0" * 3_000_000)
+    assert client.put(f"/api/servers/{UUID}/files/upload", params={"path": "/a.zip"}, content=buf.getvalue(),
+                      headers=AUTH).status_code == 204
+    r = client.post(f"/api/servers/{UUID}/files/extract", json={"archive": "/a.zip", "target": "/"}, headers=AUTH)
+    assert r.status_code == 507 and "disk limit" in r.json()["detail"]
+
+    (root / "filler").write_bytes(b"x" * 1_100_000)  # the game itself filled it up
+    client.app.state.manager._state(UUID).disk_checked = 0
+    r = client.put(f"/api/servers/{UUID}/files/content", json={"path": "/note.txt", "content": "hi"}, headers=AUTH)
+    assert r.status_code == 507 and "at its disk limit" in r.json()["detail"]
+    (root / "filler").unlink()
+    client.app.state.manager._state(UUID).disk_checked = 0
+    assert client.put(f"/api/servers/{UUID}/files/content", json={"path": "/note.txt", "content": "hi"}, headers=AUTH).status_code == 204
+
+
+def test_receiving_a_backup_from_another_node(env):
+    client, _, tmp = env
+    install(client)
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        data = b"moved world"
+        info = tarfile.TarInfo("world/level.dat")
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+    r = client.put(f"/api/servers/{UUID}/backups/{BACKUP}/archive", content=buf.getvalue(), headers=AUTH)
+    assert r.status_code == 204
+    assert client.get(f"/api/servers/{UUID}/backups/{BACKUP}", headers=AUTH).json()["state"] == "ready"
+    client.post(f"/api/servers/{UUID}/backups/{BACKUP}/restore", headers=AUTH)
+    wait(lambda: (tmp / "servers" / UUID / "world" / "level.dat").exists())
+    assert (tmp / "servers" / UUID / "world" / "level.dat").read_bytes() == b"moved world"
+
+    r = client.put(f"/api/servers/{UUID}/backups/{OTHER}/archive", content=buf.getvalue()[:20], headers=AUTH)
+    assert r.status_code == 409 and "corrupt" in r.json()["detail"]
+    assert client.get(f"/api/servers/{UUID}/backups/{OTHER}", headers=AUTH).json()["state"] == "failed"

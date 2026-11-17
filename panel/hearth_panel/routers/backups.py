@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from ..context import PanelContext
 from ..deps import ctx, current_user, db_session, server_with
 from ..models import Backup, Server, User
-from ..services import events
+from ..services import events, offsite, s3
 from ..services.backups import BackupFailed, create_backup
 from ..services.node_client import NodeError
 from .files import _stream
@@ -33,7 +33,8 @@ class RestoreBody(BaseModel):
 
 def backup_out(b: Backup) -> dict:
     return {"id": b.id, "name": b.name, "kind": b.kind, "state": b.state, "size": b.size_bytes,
-            "error": b.error, "locked": b.locked, "created_at": b.created_at.isoformat()}
+            "error": b.error, "locked": b.locked, "created_at": b.created_at.isoformat(),
+            "offsite": b.offsite_state, "offsite_error": b.offsite_error}
 
 
 def _get(server: Server, backup_id: int) -> Backup:
@@ -96,6 +97,35 @@ async def restore(backup_id: int, body: RestoreBody, server: Server = Depends(ac
     return {"accepted": True}
 
 
+@router.post("/{backup_id}/fetch", status_code=202)
+async def fetch(backup_id: int, server: Server = Depends(access), db: Session = Depends(db_session),
+                context: PanelContext = Depends(ctx)):
+    """Download the off-site copy back onto the node, e.g. after the node's disk was replaced."""
+    row = _get(server, backup_id)
+    if row.state == "creating":
+        raise HTTPException(409, "That backup is busy.")
+    try:
+        await offsite.fetch(context, db, row)
+    except s3.S3Error as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return backup_out(row)
+
+
+@router.post("/{backup_id}/offsite", status_code=202)
+async def copy_offsite(backup_id: int, server: Server = Depends(access), db: Session = Depends(db_session),
+                       context: PanelContext = Depends(ctx)):
+    """Copy (or retry copying) one backup off-site."""
+    row = _get(server, backup_id)
+    if row.state != "ready":
+        raise HTTPException(409, "Only finished backups can be copied off-site.")
+    if offsite.target(db) is None:
+        raise HTTPException(409, "Set up off-site storage in Admin → Settings first.")
+    row.offsite_state = None
+    db.commit()
+    offsite.start(context, row.id)
+    return backup_out(row)
+
+
 @router.delete("/{backup_id}", status_code=204)
 async def delete(backup_id: int, server: Server = Depends(access), user: User = Depends(current_user),
                  db: Session = Depends(db_session), context: PanelContext = Depends(ctx)) -> None:
@@ -109,6 +139,7 @@ async def delete(backup_id: int, server: Server = Depends(access), user: User = 
     except NodeError as exc:
         if exc.status != 404:
             raise
+    await offsite.remove(context, db, row)
     events.emit(context, db, "backup.deleted", server=server, user=user, detail=row.name, commit=False)
     db.delete(row)
     db.commit()

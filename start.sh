@@ -2,6 +2,7 @@
 # Start Hearth on Linux or macOS.
 # Checks Docker, creates .env on the first run, builds and starts the containers,
 # waits for the panel to answer, and opens it in your browser. Safe to run again any time.
+# Without a terminal (or with HEARTH_NONINTERACTIVE=1) it takes every default without asking.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -56,7 +57,7 @@ choose_data_dir() {  # prints the chosen folder for game servers
       paths+=("$mnt/hearth")
     done < <(df -P -x tmpfs -x devtmpfs -x squashfs -x overlay -x efivarfs 2>/dev/null | awk 'NR>1 && $2 > 2097152 {print $6}')
   fi
-  if [[ ! -t 0 ]]; then printf '%s\n' "${paths[0]}"; return; fi
+  if [[ ! -t 0 || -n "${HEARTH_NONINTERACTIVE:-}" ]]; then printf '%s\n' "${paths[0]}"; return; fi
 
   echo "Where should game servers be installed? (worlds, mods and configs live here)" >&2
   local i
@@ -87,7 +88,7 @@ if [[ ! -f .env ]]; then
   detected="$(detect_ip)"
   detected="${detected:-localhost}"
   host=""
-  if [[ -t 0 ]]; then
+  if [[ -t 0 && -z "${HEARTH_NONINTERACTIVE:-}" ]]; then
     echo "Friends join your servers at this machine's address (a domain, public IP, or LAN IP)."
     read -r -p "Address to show players [$detected]: " host || true
   fi
@@ -148,7 +149,8 @@ echo
 say "Hearth is running → $url"
 [[ -n "$host" && "$host" != localhost ]] && echo "From other devices:  http://$host:$port"
 echo "Game servers are stored in $(grep -E '^HEARTH_DATA_DIR=' .env | cut -d= -f2- || echo /var/lib/hearth)"
-echo "Open game ports in your firewall/router: 25565-25575/tcp (Minecraft Java), 19132/udp (Bedrock), 2456-2457/udp (Valheim)."
+echo "Open game ports in your firewall/router: 25565-25575/tcp (Minecraft Java), 19132/udp (Bedrock), 2456-2457/udp (Valheim),"
+echo "  7777/tcp (Terraria), 7777-7778 (Satisfactory), 34197/udp (Factorio), 8211/udp (Palworld), 28015-28017 (Rust): only the games you run."
 echo "Stop with ./stop.sh   ·   Logs: docker compose logs -f"
 if [[ "${reply:-}" == *'"needs_setup":true'* ]]; then
   echo
@@ -156,7 +158,8 @@ if [[ "${reply:-}" == *'"needs_setup":true'* ]]; then
   echo "Do it from this computer or your local network (Hearth only allows the first account from there)."
 fi
 
-if is_mac; then open "$url" >/dev/null 2>&1 || true
+if [[ -n "${HEARTH_NONINTERACTIVE:-}" ]]; then :
+elif is_mac; then open "$url" >/dev/null 2>&1 || true
 elif [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]] && command -v xdg-open >/dev/null 2>&1; then
   xdg-open "$url" >/dev/null 2>&1 || true
 fi

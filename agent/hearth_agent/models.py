@@ -28,6 +28,7 @@ class ServerSpec(BaseModel):
     memory_mb: int = Field(ge=128, le=1_048_576)
     swap_mb: int = Field(default=0, ge=0, le=1_048_576)
     cpu_percent: int = Field(default=0, ge=0, le=10_000)  # 100 == one core, 0 == unlimited
+    disk_mb: int = Field(default=0, ge=0, le=1 << 30)  # 0 == unlimited; uploads/downloads stop at the limit
     data_mount: str = "/data"
     command: list[str] | None = None
     console: Literal["stdin", "exec"] = "stdin"
@@ -105,3 +106,14 @@ class SleepRequest(BaseModel):
 
 class TunnelRequest(BaseModel):
     secret: str = Field(min_length=8, max_length=255)
+
+
+class PushRequest(BaseModel):
+    """Presigned upload URLs: one for a single PUT, or one per part for a multipart upload."""
+
+    urls: list[str] = Field(min_length=1, max_length=10_000)
+    part_size: int = Field(ge=5 * 1024 * 1024)
+
+
+class PullRequest(BaseModel):
+    url: str = Field(max_length=8192, pattern=r"^https?://")

@@ -20,6 +20,8 @@ from ..deps import admin_user, ctx, current_user, db_session
 from ..models import Allocation, Node, User
 from ..security import new_node_token
 from ..serializers import allocation_out, node_out
+from .. import VERSION
+from ..services import release
 from ..services.netguard import host_is_local
 from ..services.node_client import NodeError
 
@@ -147,7 +149,10 @@ def _get(db: Session, node_id: int) -> Node:
 
 async def _probe(context: PanelContext, node: Node) -> dict[str, Any]:
     try:
-        return {"online": True, "system": await context.nodes.system(node), "error": None}
+        system = await context.nodes.system(node)
+        # An agent older than the panel may lack features the panel uses; say so.
+        outdated = release.parse(str(system.get("version") or "0")) < release.parse(VERSION)
+        return {"online": True, "system": system, "error": None, "agent_outdated": outdated}
     except NodeError as exc:
         return {"online": False, "system": None, "error": str(exc)}
 

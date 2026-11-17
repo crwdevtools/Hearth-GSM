@@ -10,6 +10,11 @@ import { renderCreate } from "./views/create.js";
 import { renderModpacks } from "./views/modpacks.js";
 import { renderAdmin } from "./views/admin.js";
 import { renderAccount } from "./views/account.js";
+import { renderWelcome } from "./views/welcome.js";
+import { currentTheme, setTheme, startTranslation } from "./i18n.js";
+
+startTranslation();
+matchMedia("(prefers-color-scheme: light)").addEventListener?.("change", () => currentTheme() === "system" && setTheme("system"));
 
 const app = document.getElementById("app");
 const state = { me: null, cleanup: null, crumbs: [] };
@@ -21,6 +26,7 @@ const routes = [
   [/^\/modpacks$/, renderModpacks, "modpacks"],
   [/^\/admin(?:\/(\w+))?(?:\/(\w+))?$/, renderAdmin, "admin", { admin: true }],
   [/^\/account$/, renderAccount, "account"],
+  [/^\/welcome$/, renderWelcome, "admin", { admin: true }],
 ];
 
 export function navigate(path) {

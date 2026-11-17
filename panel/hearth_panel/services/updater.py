@@ -35,7 +35,7 @@ async def check_server(ctx, db: Session, server: Server, *, apply: bool | None =
 
     newly_found = server.update_version_id != latest["id"]
     server.update_version_id, server.update_version_name = latest["id"], latest["name"]
-    should_apply = server.auto_update if apply is None else apply
+    should_apply = (server.auto_update and not server.in_maintenance()) if apply is None else apply
     if newly_found and not should_apply:
         events.emit(ctx, db, "modpack.update_available", server=server,
                     detail=f"{latest['name']} (running {server.modpack_version_name})", commit=False)
@@ -63,6 +63,9 @@ async def check_server(ctx, db: Session, server: Server, *, apply: bool | None =
         result["applied"] = True
         events.emit(ctx, db, "modpack.updated", server=server, detail=f"{old_name} → {latest['name']}",
                     commit=False)
+        from . import mods  # late: mods imports this module's neighbours
+
+        mods.restore_after_update(ctx, server.id)
     db.commit()
     return result
 

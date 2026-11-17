@@ -17,7 +17,9 @@ from .config import Settings
 from .context import PanelContext
 from .routers import account, admin, auth, backups, catalog, files, mods, nodes, players, schedules, servers, sharing, users
 from .services import settings_store, updater
+from . import VERSION
 from .services import backups as backup_jobs
+from .services import panel_backup
 from .services.monitor import Monitor
 from .services.scheduler import Scheduler
 from .services.http import UpstreamError
@@ -54,7 +56,7 @@ def register_local_node(db, settings: Settings) -> None:
                 token=settings.local_node_token, public_host=settings.local_public_host)
     db.add(node)
     db.flush()
-    db.add_all(Allocation(node_id=node.id, port=p) for p in [*range(25565, 25576), 19132, 2456, 2457])
+    db.add_all(Allocation(node_id=node.id, port=p) for p in [*range(25565, 25576), 19132, 2456, 2457, 7777, 7778, 7779, 34197, 8211, 28015, 28016, 28017])
     db.commit()
     log.info("registered the local agent at %s as node 'local'", settings.local_node_url)
 
@@ -72,7 +74,7 @@ def create_app(context: PanelContext | None = None, *, run_updater: bool = True)
         tasks = []
         if run_updater:  # background work: modpack updates, status events + auto-sleep, schedules
             backup_jobs.resume_pending(context)
-            tasks = [asyncio.create_task(updater.run_forever(context)),
+            tasks = [asyncio.create_task(panel_backup.run_forever(context)),asyncio.create_task(updater.run_forever(context)),
                      asyncio.create_task(app.state.monitor.run_forever()),
                      asyncio.create_task(app.state.scheduler.run_forever())]
         yield
@@ -82,7 +84,7 @@ def create_app(context: PanelContext | None = None, *, run_updater: bool = True)
                 await task
         await context.close()
 
-    app = FastAPI(title="Hearth", version="0.1.0", lifespan=lifespan, docs_url="/api/docs", redoc_url=None)
+    app = FastAPI(title="Hearth", version=VERSION, lifespan=lifespan, docs_url="/api/docs", redoc_url=None)
     app.state.ctx = context
     app.state.monitor = Monitor(context)
     app.state.scheduler = Scheduler(context)

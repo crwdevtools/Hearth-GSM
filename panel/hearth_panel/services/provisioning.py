@@ -74,6 +74,8 @@ def build_spec(server: Server, curseforge_key: str | None = None) -> dict[str, A
         env["MEMORY"] = f"{jvm_heap_mb(server.memory_mb)}M"
         env.update(_modpack_env(server, curseforge_key))
         image = template.image_for({"_MC_VERSION": minecraft_version(server)}) if template.image_for else image
+    if "proxy" in template.features:
+        env["MEMORY"] = f"{jvm_heap_mb(server.memory_mb)}M"
     if "custom_image" in template.features:
         image = str(values.get("IMAGE") or "")
         if not image:
@@ -92,12 +94,14 @@ def build_spec(server: Server, curseforge_key: str | None = None) -> dict[str, A
         "memory_mb": server.memory_mb,
         "swap_mb": server.swap_mb,
         "cpu_percent": server.cpu_percent,
+        "disk_mb": server.disk_mb,
         "data_mount": data_mount,
         "console": template.console,
         "console_exec": list(template.console_exec) or None,
         "stop_timeout": template.stop_timeout,
         "pre_backup": list(template.pre_backup),
         "post_backup": list(template.post_backup),
+        **({"command": template.command_for(values)} if template.command_for else {}),
     }
 
 

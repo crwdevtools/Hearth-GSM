@@ -78,6 +78,8 @@ def server_out(server: Server, status: dict[str, Any] | None = None) -> dict[str
         "auto_stop_minutes": server.auto_stop_minutes,
         "wake_on_join": server.wake_on_join,
         "suspended": server.suspended,
+        "moving": _moving(server.id),
+        "maintenance_until": server.maintenance_until.isoformat() if server.in_maintenance() else None,
         "suspended_reason": server.suspended_reason,
         "memory_mb": server.memory_mb,
         "swap_mb": server.swap_mb,
@@ -108,3 +110,9 @@ def server_out(server: Server, status: dict[str, Any] | None = None) -> dict[str
         "status": status or {"state": "unknown"},
         "created_at": server.created_at.isoformat() if server.created_at else None,
     }
+
+
+def _moving(server_id: int) -> str | None:
+    from .services.moves import moving
+
+    return moving.get(server_id)

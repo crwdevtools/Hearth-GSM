@@ -1,0 +1,86 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  python:
+    name: Unit and API tests, browser click-through
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            panel/requirements.txt
+            agent/requirements.txt
+            requirements-dev.txt
+      - run: pip install -r requirements-dev.txt playwright pyflakes
+      - name: Lint
+        run: python -m pyflakes panel/hearth_panel agent/hearth_agent tests tools
+      - name: Tests
+        run: python -m pytest -q
+      - name: Browser click-through against the demo
+        run: |
+          python -m playwright install --with-deps chromium
+          python tools/demo.py > demo.log 2>&1 &
+          for i in $(seq 60); do curl -fs http://127.0.0.1:8000/api/auth/state >/dev/null && break; sleep 1; done
+          python tools/e2e.py
+      - if: failure()
+        run: cat demo.log || true
+
+  shell:
+    name: start.sh (stand-in Docker)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - run: shellcheck start.sh stop.sh
+      - name: First run, then a hand-made .env with an empty token
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          printf '#!/usr/bin/env bash\necho "docker $*" >> "$DOCKER_CALLS"\n' > "$RUNNER_TEMP/bin/docker"
+          chmod +x "$RUNNER_TEMP/bin/docker"
+          python3 tools/ci/stub_panel.py 8000 &
+          export PATH="$RUNNER_TEMP/bin:$PATH" DOCKER_CALLS="$RUNNER_TEMP/calls" HEARTH_NONINTERACTIVE=1
+          ./start.sh
+          test "$(stat -c %a .env)" = 600
+          grep -Eq '^HEARTH_AGENT_TOKEN=[0-9a-f]{64}$' .env
+          grep -q 'compose build --pull' "$DOCKER_CALLS"
+          grep -q 'compose up -d' "$DOCKER_CALLS"
+          cp .env.example .env
+          ./start.sh
+          grep -Eq '^HEARTH_AGENT_TOKEN=[0-9a-f]{64}$' .env
+
+  windows:
+    name: start.bat (stand-in Docker)
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: First run, then a hand-made .env with an empty token
+        shell: pwsh
+        run: |
+          $env:PATH = "$PWD\tools\ci;$env:PATH"
+          $env:DOCKER_CALLS = "$env:RUNNER_TEMP\calls.txt"
+          $env:HEARTH_NONINTERACTIVE = "1"
+          Start-Process python -ArgumentList "tools/ci/stub_panel.py", "8000" -NoNewWindow
+          cmd /c start.bat
+          if ($LASTEXITCODE -ne 0) { throw "start.bat failed on the first run" }
+          $envText = Get-Content .env -Raw
+          if ($envText -notmatch '(?m)^HEARTH_AGENT_TOKEN=[0-9a-f]{64}\r?$') { throw "no token in .env" }
+          if ($envText -notmatch '(?m)^HEARTH_DATA_DIR=C:\\Hearth\r?$') { throw "data folder not set" }
+          $calls = Get-Content $env:DOCKER_CALLS -Raw
+          if ($calls -notmatch 'compose build --pull' -or $calls -notmatch 'compose up -d') { throw "docker wasn't called as expected: $calls" }
+          Copy-Item .env.example .env -Force
+          cmd /c start.bat
+          if ($LASTEXITCODE -ne 0) { throw "start.bat failed with a hand-made .env" }
+          if ((Get-Content .env -Raw) -notmatch '(?m)^HEARTH_AGENT_TOKEN=[0-9a-f]{64}\r?$') { throw "empty token wasn't filled" }

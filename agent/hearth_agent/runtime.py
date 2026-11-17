@@ -258,6 +258,25 @@ class ServerManager:
             raise ServerNotFound(uuid)
         return ServerSpec.model_validate_json(path.read_text())
 
+    def disk_used(self, uuid: str, max_age: float = 10.0) -> int:
+        st = self._state(uuid)
+        now = time.time()
+        if now - st.disk_checked > max_age:
+            st.disk_bytes = directory_size(self.data_path(uuid))
+            st.disk_checked = now
+        return st.disk_bytes
+
+    def disk_room(self, root: Path) -> int | None:
+        """Bytes a server folder may still grow by under its disk limit (None: no limit)."""
+        uuid = root.name
+        try:
+            spec = self.load_spec(uuid)
+        except (ServerNotFound, ValueError):
+            return None
+        if not spec.disk_mb or root != self.data_path(uuid):
+            return None
+        return spec.disk_mb * 1048576 - self.disk_used(uuid)
+
     def known_servers(self) -> list[str]:
         return sorted(p.stem for p in self.config.state_dir.glob("*.json"))
 

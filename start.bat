@@ -2,6 +2,7 @@
 rem Start Hearth on Windows (Docker Desktop).
 rem Checks Docker, creates .env on the first run, builds and starts the containers,
 rem waits for the panel to answer, and opens it in your browser. Safe to run again any time.
+rem Set HEARTH_NONINTERACTIVE=1 to take every default without asking (used by CI).
 setlocal EnableExtensions
 cd /d "%~dp0"
 title Hearth
@@ -51,7 +52,7 @@ echo.
 echo Which drive should game servers be installed on? Local drives:
 powershell -NoProfile -Command "Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | ForEach-Object { '   {0}   {1,6:N0} GB free of {2,6:N0} GB   {3}' -f $_.DeviceID, ($_.FreeSpace/1GB), ($_.Size/1GB), $_.VolumeName }"
 set "DRIVE="
-set /p "DRIVE=Drive letter [C]: "
+if not defined HEARTH_NONINTERACTIVE set /p "DRIVE=Drive letter [C]: "
 if not defined DRIVE set "DRIVE=C"
 powershell -NoProfile -Command "if ($env:DRIVE -notmatch '^[A-Za-z]:?\\?$') { exit 1 }"
 if errorlevel 1 (echo Type just the drive letter, like D. & goto ask_drive)
@@ -66,7 +67,7 @@ echo Game servers will be installed in %DATA_DIR%
 echo.
 echo Friends join your servers at this machine's address: a domain, public IP, or LAN IP.
 set "PUBLIC_HOST="
-set /p "PUBLIC_HOST=Address to show players [%DETECTED%]: "
+if not defined HEARTH_NONINTERACTIVE set /p "PUBLIC_HOST=Address to show players [%DETECTED%]: "
 if not defined PUBLIC_HOST set "PUBLIC_HOST=%DETECTED%"
 rem Checked through an environment variable, so quotes or symbols typed here can't break anything.
 powershell -NoProfile -Command "if ($env:PUBLIC_HOST -notmatch '^[A-Za-z0-9.:-]+$') { exit 1 }"
@@ -146,13 +147,16 @@ echo Hearth is running at http://localhost:%PORT%
 if defined SHOW_HOST if /i not "%SHOW_HOST%"=="localhost" echo From other devices:  http://%SHOW_HOST%:%PORT%
 for /f "tokens=2 delims==" %%d in ('findstr /b "HEARTH_DATA_DIR=" .env') do echo Game servers are stored in %%d
 echo Open game ports in Windows Firewall and your router: 25565-25575 TCP for Minecraft Java,
-echo 19132 UDP for Bedrock, 2456-2457 UDP for Valheim.
+echo 19132 UDP for Bedrock, 2456-2457 UDP for Valheim, 7777 TCP for Terraria, 7777-7778 for
+echo Satisfactory, 34197 UDP for Factorio, 8211 UDP for Palworld, 28015-28017 for Rust.
+echo Only open the ones for games you run.
 echo Stop it with stop.bat
 if defined NEEDS_SETUP (
   echo.
   echo Next: create your admin account at http://localhost:%PORT%
   echo Do it from this computer or your local network. Hearth only allows the first account from there.
 )
+if defined HEARTH_NONINTERACTIVE exit /b 0
 start "" "http://localhost:%PORT%"
 echo.
 pause
@@ -171,5 +175,5 @@ exit /b 0
 
 :fail
 echo.
-pause
+if not defined HEARTH_NONINTERACTIVE pause
 exit /b 1

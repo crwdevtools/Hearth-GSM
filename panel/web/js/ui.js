@@ -116,7 +116,7 @@ export function confirmDialog({ title, body, confirm = "Confirm", danger = false
       h("form", { method: "dialog" },
         h("div", { class: "dialog-body" },
           h("h2", { id: "dlg-title" }, title),
-          body ? h("p", {}, body) : null,
+          body ? (typeof body === "string" ? h("p", {}, body) : body) : null,
           typeToConfirm ? h("div", { class: "field" }, h("span", { class: "hint" }, "Type ", h("code", {}, typeToConfirm), " to confirm."), input) : null,
         ),
         h("div", { class: "dialog-foot" },
@@ -136,13 +136,13 @@ export function confirmDialog({ title, body, confirm = "Confirm", danger = false
   });
 }
 
-export function promptDialog({ title, label, value = "", confirm = "Save" }) {
+export function promptDialog({ title, label, value = "", confirm = "Save", hint = null }) {
   return new Promise((resolve) => {
     const input = h("input", { class: "mono", value, autocomplete: "off", spellcheck: "false", required: true, maxlength: 255 });
     let result = null;
     const dialog = h("dialog", { "aria-labelledby": "dlg-title" },
       h("form", { method: "dialog", onsubmit: () => (result = input.value.trim() || null) },
-        h("div", { class: "dialog-body" }, h("h2", { id: "dlg-title" }, title), field(label, input)),
+        h("div", { class: "dialog-body" }, h("h2", { id: "dlg-title" }, title), field(label, input, hint ? { hint } : undefined)),
         h("div", { class: "dialog-foot" },
           h("button", { class: "btn ghost", type: "button", onclick: () => dialog.close() }, "Cancel"),
           h("button", { class: "btn primary", type: "submit" }, confirm))));

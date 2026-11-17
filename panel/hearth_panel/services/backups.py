@@ -42,7 +42,7 @@ async def create_backup(ctx, db: Session, server: Server, *, name: str | None = 
         db.commit()
         raise BackupFailed(str(exc)) from exc
     events.emit(ctx, db, "backup.started", server=server, user=user, detail=row.name)
-    job = _finish(ctx, row.id, keep)
+    job = _finish(ctx, row.id, keep, offsite=True)
     if wait:
         await job
         db.refresh(row)
@@ -55,7 +55,14 @@ async def create_backup(ctx, db: Session, server: Server, *, name: str | None = 
     return row
 
 
-async def _finish(ctx, backup_id: int, keep: int | None) -> None:
+def watch(ctx, backup_id: int, *, offsite: bool) -> None:
+    """Finish a backup row in the background (also used after pulling one back from off-site)."""
+    task = asyncio.get_running_loop().create_task(_finish(ctx, backup_id, None, offsite=offsite))
+    _tasks.add(task)
+    task.add_done_callback(_tasks.discard)
+
+
+async def _finish(ctx, backup_id: int, keep: int | None, *, offsite: bool = True) -> None:
     waited = 0.0
     while waited < TIMEOUT:
         await asyncio.sleep(POLL)
@@ -81,6 +88,10 @@ async def _finish(ctx, backup_id: int, keep: int | None) -> None:
                             detail=f"{row.name} ({row.size_bytes / 1048576:.0f} MB)")
                 if keep:
                     await prune(ctx, db, server, keep, kind=row.kind)
+                if offsite and row.offsite_state is None:
+                    from . import offsite as offsite_copies
+
+                    offsite_copies.start(ctx, row.id)
             else:
                 row.state, row.error = "failed", meta.get("error") or "The node lost track of this backup."
                 db.commit()
@@ -100,7 +111,7 @@ def resume_pending(ctx) -> int:
         ids = list(db.scalars(select(Backup.id).where(Backup.state == "creating")))
     loop = asyncio.get_running_loop()
     for backup_id in ids:
-        task = loop.create_task(_finish(ctx, backup_id, None))
+        task = loop.create_task(_finish(ctx, backup_id, None, offsite=True))
         _tasks.add(task)
         task.add_done_callback(_tasks.discard)
     return len(ids)
@@ -112,12 +123,15 @@ async def prune(ctx, db: Session, server: Server, keep: int, kind: str) -> int:
                                                 Backup.state == "ready", Backup.locked.is_(False))
                            .order_by(Backup.created_at.desc())))
     removed = 0
+    from . import offsite as offsite_copies
+
     for row in rows[keep:]:
         try:
             await ctx.nodes.backup_delete(server.node, server.uuid, row.uuid)
         except NodeError as exc:
             log.warning("couldn't prune backup %s: %s", row.uuid, exc)
             continue
+        await offsite_copies.remove(ctx, db, row)
         db.delete(row)
         removed += 1
     db.commit()

@@ -1,0 +1,27 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check the version numbers match the tag
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          grep -q "VERSION = \"$tag\"" panel/hearth_panel/__init__.py
+          grep -q "VERSION = \"$tag\"" agent/hearth_agent/__init__.py
+          grep -q "^## $tag" CHANGELOG.md
+      - name: Publish the release with its changelog section
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          awk -v v="$tag" '$0 ~ "^## "v {on=1; next} /^## / && on {exit} on' CHANGELOG.md > notes.md
+          gh release create "$GITHUB_REF_NAME" --title "Hearth $tag" --notes-file notes.md

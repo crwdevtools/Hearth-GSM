@@ -21,6 +21,13 @@ def templates(_: User = Depends(current_user)):
     return [t.public() for t in TEMPLATES.values()]
 
 
+@router.get("/presets")
+def preset_list(_: User = Depends(current_user)):
+    from ..services.presets import public
+
+    return public()
+
+
 @router.get("/minecraft/versions")
 async def minecraft_versions(
     type: str = Query("VANILLA", pattern=r"^[A-Za-z]{3,12}$"),

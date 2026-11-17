@@ -49,7 +49,7 @@ export function joinCheck(server) {
 
 // ----- backups -----------------------------------------------------------------------------------
 
-const KIND = { manual: "Manual", scheduled: "Scheduled", "pre-update": "Before update", "pre-restore": "Safety" };
+const KIND = { manual: "Manual", scheduled: "Scheduled", "pre-update": "Before update", "pre-restore": "Safety", move: "Moved here" };
 
 export async function backupsTab(panel, ctx) {
   const s = ctx.server();
@@ -63,7 +63,7 @@ export async function backupsTab(panel, ctx) {
     const rows = await get(`/servers/${s.id}/backups`);
     clearTimeout(timer);
     if (closed) return;
-    if (rows.some((b) => b.state === "creating")) timer = setTimeout(() => load().catch(() => {}), 3000);
+    if (rows.some((b) => b.state === "creating" || b.offsite === "uploading")) timer = setTimeout(() => load().catch(() => {}), 3000);
     if (!rows.length) return replace(tbody, emptyRow(5, "No backups yet. Make one now, or add a nightly backup under Schedules."));
     replace(tbody, rows.map((b) => {
       const actions = h("div", { class: "row-actions", style: { opacity: 1 } });
@@ -84,16 +84,29 @@ export async function backupsTab(panel, ctx) {
           load();
         }));
         actions.append(restore, dl, lock);
+        if (b.offsite === "failed" || b.offsite === null) {
+          const copy = h("button", { class: "btn sm ghost icon-only", type: "button", title: b.offsite === "failed" ? "Retry off-site copy" : "Copy off-site",
+            "aria-label": `Copy ${b.name} off-site` }, icon("cloud"));
+          copy.addEventListener("click", () => busy(copy, async () => { await post(`/servers/${s.id}/backups/${b.id}/offsite`); toast("Copying off-site."); load(); }));
+          actions.append(copy);
+        }
+      } else if (b.state === "failed" && b.offsite === "done") {
+        const fetch = h("button", { class: "btn sm", type: "button", title: "Download the off-site copy back onto the node" }, icon("cloud"), "Get from off-site");
+        fetch.addEventListener("click", () => busy(fetch, async () => { await post(`/servers/${s.id}/backups/${b.id}/fetch`); toast("Downloading the off-site copy."); load(); }));
+        actions.append(fetch);
       }
       const remove = h("button", { class: "btn sm ghost icon-only", type: "button", title: "Delete", "aria-label": `Delete ${b.name}`, disabled: b.locked || b.state === "creating" }, icon("trash"));
       remove.addEventListener("click", () => busy(remove, async () => {
-        if (!(await confirmDialog({ title: `Delete “${b.name}”?`, body: "The backup file is removed from the node.", confirm: "Delete", danger: true }))) return;
+        if (!(await confirmDialog({ title: `Delete “${b.name}”?`, body: b.offsite === "done" ? "The backup file is removed from the node and from off-site storage." : "The backup file is removed from the node.", confirm: "Delete", danger: true }))) return;
         await del(`/servers/${s.id}/backups/${b.id}`);
         load();
       }));
       actions.append(remove);
       return h("tr", {},
-        h("td", {}, h("div", { class: "name" }, b.name, b.locked ? h("span", { class: "badge", style: { marginLeft: "8px" } }, "Locked") : null),
+        h("td", {}, h("div", { class: "name" }, b.name, b.locked ? h("span", { class: "badge", style: { marginLeft: "8px" } }, "Locked") : null,
+          b.offsite === "done" ? h("span", { class: "badge info", style: { marginLeft: "8px" }, title: "A copy is kept in off-site storage" }, "Off-site")
+            : b.offsite === "uploading" ? h("span", { class: "badge", style: { marginLeft: "8px" } }, "Copying off-site…")
+              : b.offsite === "failed" ? h("span", { class: "badge warn", style: { marginLeft: "8px" }, title: b.offsite_error || "" }, "Off-site copy failed") : null),
           h("div", { class: "sub" }, `${KIND[b.kind] || b.kind} · ${when(b.created_at)}`)),
         h("td", {}, b.state === "ready" ? h("span", { class: "badge ok" }, "Ready")
           : b.state === "creating" ? h("span", { class: "status", "data-state": "starting" }, h("span", { class: "dot" }), "Creating")
@@ -249,8 +262,24 @@ export async function playersTab(panel, ctx) {
     return b;
   };
 
+  const hours = (sec) => sec >= 3600 ? `${(sec / 3600).toFixed(sec >= 36000 ? 0 : 1)} h` : `${Math.max(1, Math.round(sec / 60))} min`;
+  async function statsSectionEl() {
+    let st;
+    try { st = await get(`/servers/${s.id}/players/stats`, { days: 30 }); } catch { return null; }
+    if (!st.players.length) return section("Last 30 days", "Playtime is recorded while the server runs.", h("p", { class: "faint" }, "Nobody has played yet."));
+    const rows = st.players.slice(0, 50).map((p) => h("tr", {},
+      h("td", {}, h("span", { class: "mono" }, p.name), p.online ? h("span", { class: "badge ok", style: { marginLeft: "8px" } }, "Online") : null),
+      h("td", { class: "figure right" }, hours(p.seconds)),
+      h("td", { class: "figure right hide-sm" }, String(p.sessions)),
+      h("td", { class: "right hide-sm faint" }, p.online ? "now" : when(p.last_seen))));
+    return section("Last 30 days", `${st.unique_players} ${st.unique_players === 1 ? "player" : "players"} · ${hours(st.total_seconds)} played · peak ${st.peak} online at once${st.peak_at ? ` (${when(st.peak_at)})` : ""}.`,
+      h("div", { class: "table-wrap" }, h("table", { class: "board" },
+        h("thead", {}, h("tr", {}, h("th", {}, "Player"), h("th", { class: "right" }, "Playtime"), h("th", { class: "right hide-sm" }, "Sessions"), h("th", { class: "right hide-sm" }, "Last seen"))),
+        h("tbody", {}, rows))));
+  }
+
   async function load() {
-    const d = await get(`/servers/${s.id}/players`);
+    const [d, statsEl] = await Promise.all([get(`/servers/${s.id}/players`), statsSectionEl()]);
     const wlName = nameInput("Add to whitelist");
     const opName = nameInput("Make operator");
     replace(body,
@@ -273,7 +302,8 @@ export async function playersTab(panel, ctx) {
         playerList(d.banned.map((b) => b.name), (n) => [
           h("span", { class: "faint", style: { fontSize: "13px" } }, d.banned.find((b) => b.name === n)?.reason || ""),
           btn("Unban", () => act("pardon", n)),
-        ], "Nobody is banned.")));
+        ], "Nobody is banned.")),
+      statsEl);
   }
   await load();
 }
@@ -302,7 +332,9 @@ export async function modsTab(panel, ctx) {
             toast("Removed. Restart the server to unload it.");
             loadInstalled();
           }));
-          return h("tr", {}, h("td", { class: "mono" }, f.name), h("td", { class: "figure right hide-sm" }, bytes(f.size)), h("td", { class: "right" }, rm));
+          const tag = f.added ? h("span", { class: "badge info", style: { marginLeft: "8px", height: "18px" }, title: "Installed through Hearth. Kept (and put back if needed) when the modpack updates." }, "Added by you")
+            : f.dependency ? h("span", { class: "badge", style: { marginLeft: "8px", height: "18px" }, title: "Installed because another mod needs it." }, "Dependency") : null;
+          return h("tr", {}, h("td", {}, h("span", { class: "mono" }, f.name), tag), h("td", { class: "figure right hide-sm" }, bytes(f.size)), h("td", { class: "right" }, rm));
         })))
         : h("p", { class: "faint" }, `No ${noun} yet.`)));
   }
@@ -316,7 +348,8 @@ export async function modsTab(panel, ctx) {
           const add = h("button", { class: "btn sm primary", type: "button" }, "Install");
           add.addEventListener("click", () => busy(add, async () => {
             const r = await post(`/servers/${s.id}/mods`, { project_id: p.id });
-            toast(`Installed ${r.installed.join(", ")}. Restart the server to load ${r.installed.length > 1 ? "them" : "it"}.`, "ok", 7000);
+            if (r.installed.length) toast(`Installed ${r.installed.join(", ")}. Restart the server to load ${r.installed.length > 1 ? "them" : "it"}.`, "ok", 7000);
+            else toast(`Already installed: ${r.already_installed.join(", ")}.`);
             replace(add, icon("check"), "Installed");
             loadInstalled();
           }));
@@ -338,7 +371,7 @@ export async function modsTab(panel, ctx) {
     return;
   }
   panel.append(installed, section(`Add ${target.kind === "plugin" ? "plugins" : "mods"}`,
-    "Only versions that match this server's loader and Minecraft version are shown. Required dependencies are installed too.",
+    "Only versions that match this server's loader and Minecraft version are shown. Required dependencies are installed too, unless they're already there.",
     h("label", { class: "search", style: { maxWidth: "none" } }, icon("search"), search), results));
   runSearch();
 }

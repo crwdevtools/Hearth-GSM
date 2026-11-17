@@ -54,7 +54,11 @@ def login(page: Page, user: str, password: str) -> None:
 
 
 def toast(page: Page, text: str) -> None:
-    expect(page.locator(".toast", has_text=text).last).to_be_visible(timeout=10_000)
+    try:
+        expect(page.locator(".toast", has_text=text).last).to_be_visible(timeout=10_000)
+    except AssertionError as exc:  # say what the page showed instead
+        shown = page.locator(".toast").all_inner_texts()
+        raise AssertionError(f"no {text!r} toast; showing {shown}") from exc
 
 
 def status_is(page: Page, label: str, timeout=20_000) -> None:
@@ -98,6 +102,18 @@ def console(page: Page):
     expect(page.locator(".console-out")).to_contain_text("players online", timeout=10_000)
     box.press("ArrowUp")
     expect(box).to_have_value("list")
+    box.press("ArrowDown")
+    expect(box).to_have_value("")
+    search = page.get_by_label("Search console output")
+    search.fill("players online")
+    expect(page.locator(".console-found mark").first).to_have_text("players online")
+    expect(page.locator(".console-out")).to_be_hidden()
+    search.press("Escape")
+    expect(page.locator(".console-out")).to_be_visible()
+    page.reload()
+    box = page.get_by_label("Console command")
+    box.press("ArrowUp")
+    expect(box).to_have_value("list")  # history survives a reload
 
 
 @step("power: restart, stop, start")
@@ -482,6 +498,46 @@ def two_factor(browser):
     page.close()
 
 
+@step("welcome: setup wizard walks through four steps")
+def welcome(page: Page):
+    page.goto(f"{BASE}/#/welcome")
+    expect(page.locator("h1")).to_have_text("Welcome to Hearth")
+    expect(page.locator(".wizard-steps li[aria-current=step]")).to_contain_text("Time zone")
+    page.get_by_role("button", name="Next").click()
+    expect(page.locator(".wizard-card h2")).to_have_text("Your machine")
+    expect(page.locator(".wizard-node", has_text="home-box")).to_contain_text("Online")
+    page.get_by_role("button", name="Next").click()
+    expect(page.get_by_label("Discord webhook for alerts")).to_be_visible()
+    page.get_by_role("button", name="Save and continue").click()
+    expect(page.locator(".wizard-card h2")).to_have_text("You're set")
+    page.get_by_role("link", name="Go to the dashboard").click()
+    expect(page.locator("tr.row").first).to_be_visible()
+
+
+@step("appearance: light theme and French")
+def appearance(page: Page):
+    page.goto(f"{BASE}/#/account")
+    page.get_by_label("Theme").select_option("light")
+    expect(page.locator("html")).to_have_attribute("data-theme", "light")
+    bg = page.evaluate("getComputedStyle(document.body).backgroundColor")
+    assert bg == "rgb(250, 250, 250)", bg
+    console_bg = page.evaluate("getComputedStyle(document.documentElement).getPropertyValue('--term-bg').trim()")
+    assert console_bg == "#050505", console_bg  # the console stays dark
+    page.reload()
+    expect(page.locator("html")).to_have_attribute("data-theme", "light")  # remembered, no flash
+    page.get_by_label("Language").select_option("fr")
+    page.wait_for_load_state()
+    expect(page.get_by_role("link", name="Serveurs")).to_be_visible()
+    expect(page.locator("html")).to_have_attribute("lang", "fr")
+    page.goto(f"{BASE}/#/")
+    expect(page.get_by_role("link", name="Nouveau serveur").first).to_be_visible()
+    page.goto(f"{BASE}/#/account")
+    page.get_by_label("Langue").select_option("en")
+    page.wait_for_load_state()
+    page.get_by_label("Theme").select_option("dark")
+    expect(page.locator("html")).to_have_attribute("data-theme", "dark")
+
+
 def main() -> int:
     with sync_playwright() as p:
         browser = p.chromium.launch()
@@ -513,6 +569,8 @@ def main() -> int:
         validation(page)
         admin(page)
         admin_extras(page)
+        welcome(page)
+        appearance(page)
         delete(page, sid)
         friend(browser)
         quota_user(browser)

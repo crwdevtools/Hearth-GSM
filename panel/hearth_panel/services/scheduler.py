@@ -192,6 +192,8 @@ class Scheduler:
         nodes = self.ctx.nodes
         if server.suspended:
             return "Skipped: server is suspended."
+        if server.in_maintenance():
+            return "Skipped: server is paused for maintenance."
         if schedule.action == "backup":
             row = await create_backup(self.ctx, db, server, kind="scheduled", wait=True,
                                       keep=max(1, schedule.keep_backups), name=f"{schedule.name}")

@@ -21,7 +21,7 @@ from . import VERSION, files
 from .config import AgentConfig
 from .backups import BackupStore
 from .models import (BackupRequest, Command, ExtractRequest, FetchRequest, FileWrite, PathBody, PowerAction,
-                     RenameBody, ServerSpec, SleepRequest, TunnelRequest, UUID_RE)
+                     PullRequest, PushRequest, RenameBody, ServerSpec, SleepRequest, TunnelRequest, UUID_RE)
 from .runtime import RuntimeFailure, ServerManager, ServerNotFound
 
 log = logging.getLogger("hearth.agent")
@@ -40,6 +40,7 @@ def create_app(config: AgentConfig | None = None, docker_factory: Callable[[], A
             client = docker_factory()
         app.state.manager = ServerManager(config, client)
         app.state.backups = BackupStore(app.state.manager)
+        files.quota_room = app.state.manager.disk_room
         await asyncio.to_thread(app.state.manager.resume)
         app.state.manager.start_sampler()
         yield
@@ -141,6 +142,10 @@ def create_app(config: AgentConfig | None = None, docker_factory: Callable[[], A
     async def file_read(uuid: str, path: str) -> dict[str, str]:
         return {"content": await asyncio.to_thread(files.read_text, root(uuid), path)}
 
+    @app.get("/api/servers/{uuid}/files/hashes", dependencies=auth)
+    async def file_hashes(uuid: str, path: str = Query(..., max_length=1024)) -> dict[str, str]:
+        return await asyncio.to_thread(files.hash_files, root(uuid), path)
+
     @app.put("/api/servers/{uuid}/files/content", status_code=204, dependencies=auth)
     async def file_write(uuid: str, body: FileWrite) -> None:
         await asyncio.to_thread(files.write_text, writable_root(uuid), body.path, body.content)
@@ -183,6 +188,31 @@ def create_app(config: AgentConfig | None = None, docker_factory: Callable[[], A
         await asyncio.to_thread(app.state.backups.restore, check_uuid(uuid), backup_id_ok(backup_id))
         return {"accepted": True}
 
+    @app.put("/api/servers/{uuid}/backups/{backup_id}/archive", status_code=204, dependencies=auth)
+    async def receive_backup(uuid: str, backup_id: str, request: Request) -> None:
+        """A backup archive sent by the panel, e.g. when a server moves here from another node."""
+        store = app.state.backups
+        uuid, backup_id = check_uuid(uuid), backup_id_ok(backup_id)
+        out = await asyncio.to_thread(store.receive_open, uuid, backup_id, int(request.headers.get("content-length") or 0))
+        try:
+            async for chunk in request.stream():
+                await asyncio.to_thread(out.write, chunk)
+        except BaseException:
+            await asyncio.to_thread(store.receive_abort, uuid, backup_id, out)
+            raise
+        await asyncio.to_thread(store.receive_done, uuid, backup_id, out)
+
+    @app.post("/api/servers/{uuid}/backups/{backup_id}/push", status_code=202, dependencies=auth)
+    async def push_backup(uuid: str, backup_id: str, body: PushRequest) -> dict[str, bool]:
+        await asyncio.to_thread(app.state.backups.push, check_uuid(uuid), backup_id_ok(backup_id), body.urls,
+                                body.part_size)
+        return {"accepted": True}
+
+    @app.post("/api/servers/{uuid}/backups/{backup_id}/pull", status_code=202, dependencies=auth)
+    async def pull_backup(uuid: str, backup_id: str, body: PullRequest) -> dict[str, bool]:
+        await asyncio.to_thread(app.state.backups.pull, check_uuid(uuid), backup_id_ok(backup_id), body.url)
+        return {"accepted": True}
+
     @app.get("/api/servers/{uuid}/backups/{backup_id}/download", dependencies=auth)
     async def download_backup(uuid: str, backup_id: str):
         path = app.state.backups.archive_path(check_uuid(uuid), backup_id_ok(backup_id))
@@ -199,6 +229,9 @@ def create_app(config: AgentConfig | None = None, docker_factory: Callable[[], A
             need = int(request.headers.get("content-length") or 0)
             if need and need > pending.free - files.FREE_SPACE_MARGIN:
                 raise HTTPException(507, "Not enough free disk space on the node for this upload.")
+            if need and pending.room is not None and need > pending.room:
+                raise HTTPException(507, f"This upload needs {need // 1048576} MB; the server has "
+                                         f"{max(pending.room, 0) // 1048576} MB left under its disk limit.")
             # Counted as it arrives too: a chunked upload has no Content-Length to check up front.
             async for chunk in request.stream():
                 await asyncio.to_thread(pending.write, chunk)

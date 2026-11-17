@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..context import PanelContext
 from ..deps import ctx, current_user, db_session, server_with
-from ..models import Server, User
+from ..models import Server, ServerMod, User
 from ..services import events, mods
 from ..services.node_client import NodeError
 
@@ -28,7 +29,8 @@ async def _target(context, server):
 
 
 @router.get("")
-async def installed(server: Server = Depends(access), context: PanelContext = Depends(ctx)):
+async def installed(server: Server = Depends(access), db: Session = Depends(db_session),
+                    context: PanelContext = Depends(ctx)):
     target = await _target(context, server)
     try:
         entries = await context.nodes.files(server.node, server.uuid, target.folder)
@@ -36,7 +38,11 @@ async def installed(server: Server = Depends(access), context: PanelContext = De
         if exc.status != 404:
             raise
         entries = []  # folder appears after the first start
-    jars = [{"name": e["name"], "size": e["size"], "modified": e["modified"]}
+    yours = {m.filename: m for m in db.scalars(select(ServerMod).where(ServerMod.server_id == server.id))}
+    jars = [{"name": e["name"], "size": e["size"], "modified": e["modified"],
+             # Installed through Hearth (not by a modpack): kept across modpack updates.
+             "added": e["name"] in yours and not yours[e["name"]].dependency,
+             "dependency": e["name"] in yours and yours[e["name"]].dependency}
             for e in entries if not e["is_dir"] and e["name"].endswith((".jar", ".jar.disabled"))]
     return {"target": {"kind": target.kind, "loaders": target.loaders, "game_version": target.game_version,
                        "folder": target.folder}, "installed": jars}
@@ -52,9 +58,13 @@ async def search(query: str = Query("", max_length=100), offset: int = Query(0, 
 async def install(body: InstallBody, server: Server = Depends(access), user: User = Depends(current_user),
                   db: Session = Depends(db_session), context: PanelContext = Depends(ctx)):
     target = await _target(context, server)
-    names = await mods.install(context, server, target, body.project_id)
-    events.emit(context, db, "mods.installed", server=server, user=user, detail=", ".join(names))
-    return {"installed": names, "restart_needed": True}
+    results = await mods.install(context, server, target, body.project_id)
+    mods.record(db, server, results)
+    changed = [r["filename"] for r in results if r["action"] in ("installed", "updated")]
+    already = [r["filename"] for r in results if r["action"] in ("current", "present")]
+    if changed:
+        events.emit(context, db, "mods.installed", server=server, user=user, detail=", ".join(changed))
+    return {"installed": changed, "already_installed": already, "restart_needed": bool(changed)}
 
 
 @router.delete("/{name}", status_code=204)
@@ -64,4 +74,6 @@ async def remove(name: str, server: Server = Depends(access), user: User = Depen
         raise HTTPException(400, "Not a mod file.")
     target = await _target(context, server)
     await context.nodes.delete_file(server.node, server.uuid, f"{target.folder}/{name}")
+    for row in db.scalars(select(ServerMod).where(ServerMod.server_id == server.id, ServerMod.filename == name)):
+        db.delete(row)  # removed on purpose: don't put it back after a modpack update
     events.emit(context, db, "mods.removed", server=server, user=user, detail=name)

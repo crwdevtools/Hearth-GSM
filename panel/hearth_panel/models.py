@@ -140,6 +140,17 @@ class Server(Base):
     wake_on_join: Mapped[bool] = mapped_column(Boolean, default=True, server_default=true())
     suspended: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
     suspended_reason: Mapped[str | None] = mapped_column(String(255))
+    # Maintenance pause: schedules, auto-updates, auto-sleep and crash handling hold off until then.
+    maintenance_until: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    # Behind a Velocity proxy (another server): which one, and its place in the proxy's try order.
+    proxy_id: Mapped[int | None] = mapped_column(ForeignKey("servers.id", ondelete="SET NULL"))
+    proxy_order: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
+
+    def in_maintenance(self, now: datetime | None = None) -> bool:
+        if self.maintenance_until is None:
+            return False
+        until = self.maintenance_until if self.maintenance_until.tzinfo else self.maintenance_until.replace(tzinfo=timezone.utc)
+        return until > (now or utcnow())
 
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow)
 
@@ -197,6 +208,10 @@ class Backup(Base):
     error: Mapped[str | None] = mapped_column(Text)
     locked: Mapped[bool] = mapped_column(Boolean, default=False)  # never pruned automatically
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow)
+    # Off-site copy (Admin → Settings → Off-site backups): None | uploading | done | failed
+    offsite_state: Mapped[str | None] = mapped_column(String(16))
+    offsite_key: Mapped[str | None] = mapped_column(String(512))
+    offsite_error: Mapped[str | None] = mapped_column(Text)
 
     server: Mapped[Server] = relationship(back_populates="backups")
 
@@ -217,6 +232,24 @@ class Schedule(Base):
     last_result: Mapped[str | None] = mapped_column(Text)
 
     server: Mapped[Server] = relationship(back_populates="schedules")
+
+
+class ServerMod(Base):
+    """A mod or plugin someone installed through Hearth (as opposed to one a modpack brought), so
+    it can be shown as theirs and put back if a modpack update removes it."""
+
+    __tablename__ = "server_mods"
+    __table_args__ = (UniqueConstraint("server_id", "project_id"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    server_id: Mapped[int] = mapped_column(ForeignKey("servers.id", ondelete="CASCADE"), index=True)
+    project_id: Mapped[str] = mapped_column(String(32))
+    filename: Mapped[str] = mapped_column(String(255))
+    version_id: Mapped[str | None] = mapped_column(String(32))
+    dependency: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow)
+
+    server: Mapped["Server"] = relationship()
 
 
 class AuditLog(Base):
@@ -257,3 +290,15 @@ class Webhook(Base):
     secret: Mapped[str] = mapped_column(String(128))  # HMAC-SHA256 signing key
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow)
+
+
+class PlayerSession(Base):
+    """One stretch of a player being online, as seen by the monitor's `list` checks (to the minute)."""
+
+    __tablename__ = "player_sessions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    server_id: Mapped[int] = mapped_column(ForeignKey("servers.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(16), index=True)
+    joined_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow)
+    left_at: Mapped[datetime | None] = mapped_column(UTCDateTime())  # None while online

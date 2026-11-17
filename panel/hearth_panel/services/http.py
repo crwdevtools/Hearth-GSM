@@ -30,6 +30,17 @@ class PublicHTTP:
             resp = await self.client.get(url, params=params, headers=headers)
         except httpx.HTTPError as exc:
             raise UpstreamError(service, f"could not connect ({exc.__class__.__name__})") from exc
+        return self._decode(service, resp)
+
+    async def post_json(self, service: str, url: str, body: Any, *, headers: dict[str, str] | None = None) -> Any:
+        try:
+            resp = await self.client.post(url, json=body, headers=headers)
+        except httpx.HTTPError as exc:
+            raise UpstreamError(service, f"could not connect ({exc.__class__.__name__})") from exc
+        return self._decode(service, resp)
+
+    @staticmethod
+    def _decode(service: str, resp: httpx.Response) -> Any:
         if resp.status_code in (401, 403):
             raise UpstreamError(service, "the API key was rejected", 502)
         if resp.status_code == 404:

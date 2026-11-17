@@ -21,7 +21,7 @@ import time
 import urllib.parse
 import urllib.request
 import zipfile
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any, BinaryIO
 
@@ -202,12 +202,24 @@ def open_read(root: Path, relative: str) -> tuple[BinaryIO, int, str]:
     return f, os.fstat(fd).st_size, parts[-1]
 
 
+# Set by the agent: how many more bytes a server folder may grow by (None == no limit).
+quota_room: Callable[[Path], int | None] = lambda _root: None
+
+
+def _limit_error(room: int) -> FileAccessError:
+    return FileAccessError("This server is at its disk limit. Delete some files or ask an admin to raise it."
+                           if room <= 0 else f"This server only has {room // 1048576} MB left under its disk limit.", 507)
+
+
 class PendingWrite:
     """A file being written next to its final name, then swapped in atomically by commit().
     Holds the parent folder open the whole time, so the folder can't be swapped for a link."""
 
     def __init__(self, root: Path, relative: str, *, margin: int = FREE_SPACE_MARGIN) -> None:
         self.margin = margin
+        self.room = quota_room(root)
+        if self.room is not None and self.room <= 0:
+            raise _limit_error(self.room)
         parts = split(relative)
         if not parts:
             raise FileAccessError("Cannot overwrite a directory.", 400)
@@ -233,6 +245,8 @@ class PendingWrite:
         self.written += len(chunk)
         if self.written > self.free - self.margin:
             raise FileAccessError("Not enough free disk space on the node for this file.", 507)
+        if self.room is not None and self.written > self.room:
+            raise _limit_error(self.room)
         self.file.write(chunk)
 
     def commit(self) -> None:
@@ -301,6 +315,26 @@ def rename(root: Path, source: str, target: str) -> None:
             os.rename(src[-1], dst[-1], src_dir_fd=sd, dst_dir_fd=dd)
         except OSError as exc:
             raise FileAccessError(f"Couldn't rename: {exc.strerror}.", 400) from None
+
+
+def hash_files(root: Path, relative: str, suffixes: tuple[str, ...] = (".jar",)) -> dict[str, str]:
+    """SHA-512 of each regular file in one folder whose name ends with `suffixes` (not recursive).
+    The panel asks Modrinth which project each hash belongs to."""
+    out: dict[str, str] = {}
+    with Dir(root, split(relative)) as d:
+        for name in sorted(os.listdir(d)):
+            if not name.endswith(suffixes):
+                continue
+            try:
+                fd = _open_regular(name, d)
+            except FileAccessError:
+                continue
+            digest = hashlib.sha512()
+            with os.fdopen(fd, "rb") as f:
+                while chunk := f.read(1 << 20):
+                    digest.update(chunk)
+            out[name] = digest.hexdigest()
+    return out
 
 
 # ----- walking a whole tree -------------------------------------------------------------------
@@ -400,11 +434,14 @@ def _find_world(folder: Path) -> Path | None:
     return hits[0] if hits else None
 
 
-def _check_size(entries: list[int], free: int) -> None:
+def _check_size(entries: list[int], free: int, room: int | None = None) -> None:
     total = sum(entries)
     if total > free - FREE_SPACE_MARGIN:
         raise FileAccessError(f"Unpacked, this archive needs {total // 1048576} MB; the node has "
                               f"{free // 1048576} MB free.", 507)
+    if room is not None and total > room:
+        raise FileAccessError(f"Unpacked, this archive needs {total // 1048576} MB; the server has "
+                              f"{max(room, 0) // 1048576} MB left under its disk limit.", 507)
 
 
 def _move_into(source: Path, dest_fd: int) -> None:
@@ -436,14 +473,15 @@ def extract_archive(root: Path, archive_rel: str, target_rel: str, *, replace: b
             tempfile.TemporaryDirectory(dir=staging_root, prefix="extract-") as tmp:
         staging = Path(tmp)
         free = free_space(archive_dir)
+        room = quota_room(root)
         with os.fdopen(_open_regular(archive_parts[-1], archive_dir), "rb") as archive:
             if name.endswith(".zip"):
                 with zipfile.ZipFile(archive) as zf:
-                    _check_size([i.file_size for i in zf.infolist()], free)  # zip bombs
+                    _check_size([i.file_size for i in zf.infolist()], free, room)  # zip bombs
                     _safe_zip_extract(zf, staging)
             else:
                 with tarfile.open(fileobj=archive) as tar:
-                    _check_size([m.size for m in tar.getmembers()], free)
+                    _check_size([m.size for m in tar.getmembers()], free, room)
                     tar.extractall(staging, filter="data")
         if not world:
             with Dir(root, target_parts, create=True) as dest:

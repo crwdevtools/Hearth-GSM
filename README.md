@@ -23,18 +23,27 @@ simpler to set up. It's written in Python and runs everything in Docker.
   Hearth update servers to new releases automatically, taking a backup first.
 - **Single mods and plugins**: search Modrinth for ones that match the server's loader and
   version. Anything they require is installed too.
-- Also **Minecraft: Bedrock**, **Valheim**, and **any Docker image**.
+- **Starter packs**: Paper with Geyser and Floodgate (Bedrock players join your Java server), or
+  Fabric with a performance pack, installed before the first start.
+- **Velocity proxy**: put several Paper servers behind one address; Hearth sets up modern
+  forwarding on every server for you.
+- Also **Minecraft: Bedrock**, **Terraria**, **Factorio**, **Palworld**, **Satisfactory**,
+  **Rust**, **Valheim**, and **any Docker image**.
 
 **Manage them**
-- **Live console**, **file manager** (edit, upload, unzip, download), **start/stop/restart**.
+- **Live console** with search and command history, **file manager** (edit, upload, unzip,
+  download), one-click `latest.log` and crash reports, **start/stop/restart**.
 - **Full config**: memory (with the Java heap sized safely for you), CPU, swap, and every common
   `server.properties` setting from a form.
 - **Backups**: manual, scheduled, and automatic before updates and restores. The server stays
-  online while a backup runs.
+  online while a backup runs. **Off-site copies** to any S3-compatible storage (Backblaze B2,
+  Cloudflare R2, AWS, Wasabi, MinIO), and a nightly copy of the panel's own database.
+- **Disk limits** per server, enforced on uploads and installs, with warnings at 90%.
 - **Schedules**: nightly restarts with in-game countdowns, backups, and console commands.
-- **Players**: who's online, whitelist, operators, kicks and bans.
+- **Players**: who's online, whitelist, operators, kicks and bans, plus playtime and peaks.
 - **Worlds**: download a world as a zip, or upload a singleplayer world to replace it.
-- **Make a copy** of a server to try an update safely.
+- **Make a copy** of a server to try an update safely, **move it to another machine**, or
+  **pause it for maintenance** (schedules, auto-updates and auto-sleep wait).
 - **Stats**: live CPU, memory, disk and network, plus 24-hour memory and CPU graphs.
 
 **Share them**
@@ -44,12 +53,14 @@ simpler to set up. It's written in Python and runs everything in Docker.
   "Check if friends can join" test that checks your server from the internet.
 - **Sleep when empty**: an idle server stops to free memory and starts again when someone joins.
 - **Notifications**: Discord messages when a server starts, stops, crashes, runs out of memory,
-  updates or finishes a backup.
+  updates or finishes a backup. **Admin alerts** for crash loops (the server is stopped), full
+  disks, failed backups and machines going offline.
 
 **Run it seriously**
 - **Many machines** ("nodes") from one panel: your PC, a home server, VPSs from any provider.
 - **Two-factor sign-in**, **API tokens**, signed **webhooks**, an **activity log**, and
   **suspend/unsuspend** (enough to connect a billing system if you rent servers out).
+- A **setup wizard** on first run, **light and dark themes**, and **English or French**.
 - Works on phones.
 
 ![A server's console](docs/images/console.png)

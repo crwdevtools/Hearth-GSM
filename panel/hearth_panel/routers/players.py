@@ -92,3 +92,11 @@ async def act(body: PlayerAction, server: Server = Depends(access), user: User =
         raise HTTPException(409, f"The server must be running to do that ({exc}).") from exc
     events.emit(context, db, "players.changed", server=server, user=user, detail=label.format(name=body.name))
     return {"output": (output or "").strip()}
+
+
+@router.get("/stats")
+def player_stats(days: int = 30, server: Server = Depends(access), db: Session = Depends(db_session)):
+    """Playtime per player, peaks and unique players over the last `days` days."""
+    from ..services import playtime
+
+    return playtime.stats(db, server, max(1, min(days, 365)))

@@ -8,6 +8,7 @@ import ipaddress
 import json
 import logging
 import re
+from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
@@ -21,7 +22,8 @@ from ..deps import (admin_user, ctx, current_user, db_session, permissions_for, 
                     visible_servers_query, websocket_user)
 from ..models import Allocation, AuditLog, Node, Server, User
 from ..serializers import server_out
-from ..services import events, settings_store, updater
+from ..services import events, moves, presets, settings_store, updater
+from ..services import proxy as proxy_links
 from ..services.backups import BackupFailed, create_backup
 from ..services.events import is_discord_webhook
 from ..services.node_client import NodeError, console_ws_url
@@ -59,6 +61,7 @@ class ServerCreate(BaseModel):
     auto_update: bool = False
     accept_eula: bool = False
     start: bool = True
+    preset: str | None = Field(default=None, max_length=32)
 
 
 def _clean_address(v: str | None) -> str | None:
@@ -252,6 +255,12 @@ async def create_server(body: ServerCreate, user: User = Depends(current_user), 
         raise HTTPException(404, "Owner not found.")
 
     variables = coerce_variables(template, {**defaults(template), **body.variables})
+    preset = None
+    if body.preset:
+        try:
+            preset = presets.check(body.preset, template.key, variables, body.modpack is not None)
+        except presets.PresetError as exc:
+            raise HTTPException(400, str(exc)) from exc
     check_capacity(db, node, body.memory_mb, body.disk_mb)
 
     server = Server(
@@ -266,12 +275,27 @@ async def create_server(body: ServerCreate, user: User = Depends(current_user), 
     db.flush()
     for alloc, is_primary in picks:
         claim(db, alloc, server.id, is_primary=is_primary, is_template=not is_primary)
+    db.flush()
+    db.refresh(server)
+    warnings = []
+    if preset and preset.bedrock_port:
+        warnings.append(presets.claim_bedrock_port(db, server))
     if owner.id == user.id:
         recheck_quota(db, user)
     db.commit()
     db.refresh(server)
-    events.emit(context, db, "server.created", server=server, user=user, detail=f"{template.name} on {node.name}")
-    warning = await sync(context, db, server, start=body.start)
+    events.emit(context, db, "server.created", server=server, user=user,
+                detail=f"{template.name} on {node.name}" + (f" ({preset.name})" if preset else ""))
+    if preset is None:
+        warnings.append(await sync(context, db, server, start=body.start))
+    else:  # plugins/mods go in before the first start
+        warnings.append(await sync(context, db, server, start=False))
+        if not warnings[-1]:
+            warnings.append(await presets.install(context, db, server, preset))
+            if body.start:
+                with contextlib.suppress(NodeError):
+                    await context.nodes.power(server.node, server.uuid, "start")
+    warning = " ".join(w for w in warnings if w) or None
     return {**_out(server, user, {"state": "installing"}), "warning": warning}
 
 
@@ -423,6 +447,8 @@ async def reinstall(server: Server = Depends(server_with("settings")), user: Use
 @router.post("/{server_id}/power", status_code=202)
 async def power(body: PowerBody, server: Server = Depends(server_with("power")), user: User = Depends(current_user),
                 db: Session = Depends(db_session), context: PanelContext = Depends(ctx)):
+    if server.id in moves.moving:
+        raise HTTPException(409, "This server is moving to another node. Try again when it's done.")
     if server.suspended and body.action in ("start", "restart") and not user.is_admin:
         raise HTTPException(403, f"This server is suspended{': ' + server.suspended_reason if server.suspended_reason else ''}.")
     await context.nodes.power(server.node, server.uuid, body.action)
@@ -468,6 +494,90 @@ def activity(server_id: int, user: User = Depends(current_user), db: Session = D
                       .order_by(AuditLog.at.desc()).limit(min(limit, 500)))
     return [{"at": r.at.isoformat(), "action": r.action, "detail": r.detail,
              "user": r.user.username if r.user else None} for r in rows]
+
+
+class MoveBody(BaseModel):
+    node_id: int
+
+
+@router.post("/{server_id}/move", status_code=202)
+async def move(body: MoveBody, server_id: int, admin: User = Depends(admin_user),
+               db: Session = Depends(db_session), context: PanelContext = Depends(ctx)):
+    """Move a server to another node (admins). Runs in the background; watch `moving`."""
+    server = server_for(server_id, admin, db)
+    target = db.get(Node, body.node_id)
+    if target is None:
+        raise HTTPException(404, "Node not found.")
+    try:
+        moves.check(db, server, target)
+    except moves.MoveError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    moves.start(context, server.id, target.id, admin.id)
+    return _out(server, admin)
+
+
+class ProxyBody(BaseModel):
+    backends: list[int] = Field(default_factory=list, max_length=64)  # in try order
+
+
+def _proxy_candidates(db: Session, proxy: Server, user: User) -> list[Server]:
+    from ..deps import permissions_for
+
+    rows = db.scalars(select(Server).where(Server.id != proxy.id).order_by(Server.name))
+    return [s for s in rows if proxy_links.eligible(s) and "settings" in permissions_for(s, user)]
+
+
+@router.get("/{server_id}/proxy")
+def proxy_backends(server_id: int, user: User = Depends(current_user), db: Session = Depends(db_session)):
+    proxy = server_for(server_id, user, db, "settings")
+    if proxy.template != "velocity":
+        raise HTTPException(400, "Only Velocity proxies have backend servers.")
+    linked = {s.id: s.proxy_order for s in db.scalars(select(Server).where(Server.proxy_id == proxy.id))}
+    candidates = _proxy_candidates(db, proxy, user)
+    return {"servers": sorted(
+        [{"id": s.id, "name": s.name, "node": s.node.name, "address": proxy_links.backend_address(proxy, s),
+          "linked": s.id in linked, "order": linked.get(s.id, 999), "other_proxy": bool(s.proxy_id and s.proxy_id != proxy.id)}
+         for s in candidates], key=lambda r: (not r["linked"], r["order"], r["name"].lower()))}
+
+
+@router.put("/{server_id}/proxy")
+async def set_proxy_backends(body: ProxyBody, server_id: int, user: User = Depends(current_user),
+                             db: Session = Depends(db_session), context: PanelContext = Depends(ctx)):
+    proxy = server_for(server_id, user, db, "settings")
+    if proxy.template != "velocity":
+        raise HTTPException(400, "Only Velocity proxies have backend servers.")
+    allowed = {s.id: s for s in _proxy_candidates(db, proxy, user)}
+    if len(set(body.backends)) != len(body.backends) or any(i not in allowed for i in body.backends):
+        raise HTTPException(400, "Only Paper or Purpur servers you can manage can go behind the proxy.")
+    chosen = [allowed[i] for i in body.backends]
+    if any(s.proxy_id and s.proxy_id != proxy.id for s in chosen):
+        raise HTTPException(409, "One of those servers is already behind another proxy.")
+    try:
+        await proxy_links.link(context, db, proxy, chosen)
+    except proxy_links.ProxyError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    events.emit(context, db, "server.proxy_linked", server=proxy, user=user,
+                detail=", ".join(s.name for s in chosen) or "No backend servers")
+    return {"restart_needed": True, **proxy_backends(server_id, user, db)}
+
+
+class MaintenanceBody(BaseModel):
+    minutes: int = Field(ge=0, le=7 * 24 * 60)  # 0 ends it now
+
+
+@router.post("/{server_id}/maintenance")
+async def maintenance(body: MaintenanceBody, server_id: int, user: User = Depends(current_user),
+                      db: Session = Depends(db_session), context: PanelContext = Depends(ctx)):
+    """Pause schedules, auto-updates, auto-sleep and crash handling while you work on a server."""
+    server = server_for(server_id, user, db, "settings")
+    if body.minutes:
+        server.maintenance_until = datetime.now(timezone.utc) + timedelta(minutes=body.minutes)
+        detail = f"Paused for {body.minutes} minutes."
+    else:
+        server.maintenance_until = None
+        detail = "Maintenance pause ended."
+    events.emit(context, db, "server.maintenance", server=server, user=user, detail=detail)
+    return _out(server, user)
 
 
 # ----- admin: suspension, allocations ----------------------------------------------------------

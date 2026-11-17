@@ -91,6 +91,9 @@ class NodeClient:
         data = await self._call(node, "GET", f"/api/servers/{uuid}/files/content", params={"path": path})
         return data["content"]
 
+    async def file_hashes(self, node: Node, uuid: str, path: str) -> dict[str, str]:
+        return await self._call(node, "GET", f"/api/servers/{uuid}/files/hashes", params={"path": path}, timeout=60)
+
     async def write_file(self, node: Node, uuid: str, path: str, content: str) -> None:
         await self._call(node, "PUT", f"/api/servers/{uuid}/files/content", json={"path": path, "content": content})
 
@@ -116,6 +119,19 @@ class NodeClient:
 
     async def backup_restore(self, node, uuid, backup_id):
         await self._call(node, "POST", f"/api/servers/{uuid}/backups/{backup_id}/restore")
+
+    async def backup_push(self, node, uuid, backup_id, urls, part_size):
+        await self._call(node, "POST", f"/api/servers/{uuid}/backups/{backup_id}/push",
+                         json={"urls": urls, "part_size": part_size})
+
+    async def receive_backup(self, node, uuid, backup_id, stream, length=None):
+        headers = {"content-length": str(length)} if length else None
+        resp = await _stream_call(self, node, "PUT", f"/api/servers/{uuid}/backups/{backup_id}/archive",
+                                  content=stream, headers=headers)
+        await resp.aclose()
+
+    async def backup_pull(self, node, uuid, backup_id, url):
+        await self._call(node, "POST", f"/api/servers/{uuid}/backups/{backup_id}/pull", json={"url": url})
 
     async def backup_download(self, node, uuid, backup_id):
         return await _stream_call(self, node, "GET", f"/api/servers/{uuid}/backups/{backup_id}/download")
@@ -165,8 +181,8 @@ class NodeClient:
 async def _stream_call(client: "NodeClient", node: Node, method: str, path: str, **kwargs):
     """Open a streaming request to the agent; caller must close the returned response."""
     url = node.url.rstrip("/") + path
-    req = client.http.build_request(method, url, headers={"Authorization": f"Bearer {node.token}"},
-                                    timeout=httpx.Timeout(600, connect=5), **kwargs)
+    headers = {**(kwargs.pop("headers", None) or {}), "Authorization": f"Bearer {node.token}"}
+    req = client.http.build_request(method, url, headers=headers, timeout=httpx.Timeout(600, connect=5), **kwargs)
     try:
         resp = await client.http.send(req, stream=True)
     except httpx.HTTPError as exc:

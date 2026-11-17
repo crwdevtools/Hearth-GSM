@@ -308,7 +308,7 @@ def test_local_node_registered_from_env(client):
         register_local_node(db, settings)
         register_local_node(db, settings)  # idempotent
         nodes = db.query(Node).all()
-        assert len(nodes) == 1 and nodes[0].name == "local" and len(nodes[0].allocations) == 14
+        assert len(nodes) == 1 and nodes[0].name == "local" and len(nodes[0].allocations) == 22
         rerun = type(settings)(**{**settings.__dict__, "local_node_token": "n" * 40})  # setup re-run
         register_local_node(db, rerun)
         db.refresh(nodes[0])
