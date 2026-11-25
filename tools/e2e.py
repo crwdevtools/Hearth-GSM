@@ -247,6 +247,31 @@ def picker(page: Page):
     expect(page.get_by_label("Search modpacks")).to_be_visible()
 
 
+@step("create from an uploaded modpack zip")
+def upload_pack(page: Page):
+    import io, json as _json, zipfile
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("modrinth.index.json", _json.dumps({
+            "formatVersion": 1, "game": "minecraft", "versionId": "3.2.1", "name": "E2E Upload Pack",
+            "files": [{"path": "mods/a.jar"}], "dependencies": {"minecraft": "1.20.1", "fabric-loader": "0.15.7"}}))
+    page.goto(BASE + "/#/")  # the previous step left this same form open; start from a fresh one
+    page.goto(BASE + "/#/servers/new")
+    page.get_by_role("button", name="Upload zip", exact=True).click()
+    page.locator("input[type=file]").set_input_files(
+        files=[{"name": "e2e.mrpack", "mimeType": "application/zip", "buffer": buf.getvalue()}])
+    expect(page.locator(".picked")).to_contain_text("E2E Upload Pack")
+    expect(page.locator(".picked")).to_contain_text("Fabric 0.15.7")
+    page.get_by_label("Name", exact=True).fill("uploaded-pack-server")
+    page.get_by_role("button", name="1 GB", exact=True).click()
+    page.get_by_text("I agree to the Minecraft").click()
+    page.get_by_role("button", name="Create server").click()
+    page.wait_for_timeout(1500)
+    seen = " | ".join(page.locator(".toast, [role=status], [role=alert]").all_inner_texts())
+    expect(page.locator("h1"), f"messages: {seen}").to_have_text("uploaded-pack-server", timeout=15_000)
+    expect(page.get_by_text("E2E Upload Pack").first).to_be_visible()
+
+
 @step("validation messages are readable, not 500s")
 def validation(page: Page):
     page.goto(BASE + "/#/admin/nodes/new")
@@ -566,6 +591,7 @@ def main() -> int:
         stats(page, sid)
         modpacks(page)
         picker(page)
+        upload_pack(page)
         validation(page)
         admin(page)
         admin_extras(page)

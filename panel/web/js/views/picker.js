@@ -1,8 +1,8 @@
 // Minecraft source editor: server software + version, or a modpack + version from Modrinth/CurseForge.
 
-import { get } from "../api.js";
+import { get, del } from "../api.js";
 import { h, icon, replace } from "../dom.js";
-import { compact, field, notice, safeUrl } from "../ui.js";
+import { bytes, compact, field, notice, safeUrl, uploadFile } from "../ui.js";
 
 export const SOFTWARE = [
   ["PAPER", "Paper"], ["VANILLA", "Vanilla"], ["PURPUR", "Purpur"], ["FABRIC", "Fabric"],
@@ -32,8 +32,9 @@ function versionLabel(v) {
 /**
  * initial: { kind: "software", server_type, version } | { kind: "modpack", modpack: {...}, auto_update }
  * allowLatest: show "Latest release" as the default modpack version (create flow)
+ * allowUpload: offer "Upload zip" for a pack downloaded by hand (create flow only)
  */
-export function sourceEditor({ initial, allowLatest = true, onChange = () => {} }) {
+export function sourceEditor({ initial, allowLatest = true, allowUpload = false, onChange = () => {} }) {
   const value = {
     kind: initial?.kind || "software",
     server_type: initial?.server_type || "PAPER",
@@ -42,13 +43,17 @@ export function sourceEditor({ initial, allowLatest = true, onChange = () => {} 
     pack: initial?.modpack || null, // {provider, project_id, name, icon_url, slug, version_id}
     provider: initial?.modpack?.provider || "modrinth",
     auto_update: initial?.auto_update ?? true,
+    upload: null, // {token, filename, size, name, version, mc_version, loader, loader_version, mods, format, slug}
+    cfPage: "",
   };
   let providers = { modrinth: true, curseforge: false };
   const initialVersion = value.version;
   const changed = () => onChange(value);
 
   const root = h("div", { class: "section-body" });
-  const kindSwitch = segmented([["software", "Server software"], ["modpack", "Modpack"]], value.kind,
+  const kinds = [["software", "Server software"], ["modpack", "Modpack"]];
+  if (allowUpload) kinds.push(["upload", "Upload zip"]);
+  const kindSwitch = segmented(kinds, value.kind,
     (k) => { value.kind = k; drawBody(); changed(); }, "Source type");
   const body = h("div", { class: "section-body" });
   root.append(kindSwitch, body);
@@ -207,8 +212,79 @@ export function sourceEditor({ initial, allowLatest = true, onChange = () => {} 
     if (value.provider !== "curseforge" || providers.curseforge) search();
   }
 
+  // ----- uploaded zip --------------------------------------------------------------------------
+  const LOADERS = { forge: "Forge", neoforge: "NeoForge", fabric: "Fabric", quilt: "Quilt" };
+  const fileInput = h("input", { type: "file", accept: ".mrpack,.zip,application/zip", hidden: true });
+  const uploadStatus = h("div", { class: "section-body" });
+  let uploading = false;
+
+  async function dropUpload() {
+    const old = value.upload;
+    value.upload = null;
+    if (old) del(`/modpacks/upload/${old.token}`).catch(() => {});
+  }
+
+  fileInput.addEventListener("change", async () => {
+    const file = fileInput.files[0];
+    fileInput.value = "";
+    if (!file) return;
+    await dropUpload();
+    uploading = true;
+    const bar = h("progress", { max: "1", value: "0", style: { width: "100%" } });
+    replace(uploadStatus, h("div", { class: "picked" }, h("div", { class: "body" },
+      h("div", { class: "t" }, `Uploading ${file.name}`), bar,
+      h("div", { class: "faint", style: { fontSize: "12.5px" } }, `${bytes(file.size)}. Hearth reads the pack's manifest when it arrives.`))));
+    changed();
+    try {
+      const info = await uploadFile(`/api/modpacks/upload?filename=${encodeURIComponent(file.name)}`, file, (f) => { bar.value = f; });
+      value.upload = info;
+    } catch (err) {
+      value.upload = null;
+      uploading = false;
+      drawUpload(err.message);
+      changed();
+      return;
+    }
+    uploading = false;
+    drawUpload();
+    changed();
+  });
+
+  function drawUpload(error) {
+    const u = value.upload;
+    const pick = h("button", { class: "btn", type: "button", onclick: () => fileInput.click() }, icon("upload"), u ? "Choose a different file" : "Choose modpack file");
+    const parts = [];
+    if (error) parts.push(notice("warn", error));
+    if (u) {
+      parts.push(h("div", { class: "picked" },
+        h("div", { class: "body" },
+          h("div", { class: "t" }, u.name),
+          h("div", { class: "faint mono", style: { fontSize: "12.5px" } },
+            [u.version, `MC ${u.mc_version}`, `${LOADERS[u.loader]} ${u.loader_version}`, u.mods ? `${u.mods} mods` : null, bytes(u.size)].filter(Boolean).join(" · ")),
+          u.summary ? h("div", { class: "faint", style: { fontSize: "13px", marginTop: "4px" } }, u.summary) : null),
+        h("span", { class: "badge ok" }, u.format === "modrinth" ? "Modrinth" : "CurseForge")));
+      if (u.format === "curseforge") {
+        const page = h("input", { id: "cf-page", type: "text", placeholder: `Optional: curseforge.com/minecraft/modpacks/${u.slug || "pack-name"}`, value: value.cfPage, maxlength: 300 });
+        page.addEventListener("input", () => { value.cfPage = page.value; changed(); });
+        parts.push(h("div", { class: "field" }, h("label", { for: "cf-page" }, "CurseForge page (optional)"), page,
+          h("span", { class: "hint" }, `Hearth guesses “${u.slug || "?"}” from the pack's name. If the install can't find the pack, paste its CurseForge page address here.`)));
+      }
+      parts.push(h("span", { class: "hint" }, "Hearth sets up the right Java and installs the mod loader when the server first starts. Mods the pack lists are downloaded then, so the first start takes a few minutes."));
+    } else if (!uploading) {
+      parts.push(h("span", { class: "hint" }, "For a pack that isn't in the catalog above, or one whose author blocks third-party downloads. Download it from Modrinth (a .mrpack file) or CurseForge (the pack's main file, not “Server files”), then add it here."));
+    }
+    parts.push(h("div", {}, pick));
+    replace(uploadStatus, ...parts);
+  }
+
+  function drawUploadTab() {
+    replace(body, uploadStatus, fileInput);
+    if (!uploading) drawUpload();
+  }
+
   function drawBody() {
     if (value.kind === "software") drawSoftware();
+    else if (value.kind === "upload") drawUploadTab();
     else drawModpack();
   }
 
@@ -219,6 +295,10 @@ export function sourceEditor({ initial, allowLatest = true, onChange = () => {} 
     el: root,
     value() {
       if (value.kind === "software") return { kind: "software", server_type: value.server_type, version: value.version || "LATEST" };
+      if (value.kind === "upload") {
+        if (!value.upload || uploading) return null;
+        return { kind: "upload", modpack_upload: { token: value.upload.token, curseforge_page: value.cfPage.trim() || null }, upload: value.upload };
+      }
       if (!value.pack) return null;
       return {
         kind: "modpack",

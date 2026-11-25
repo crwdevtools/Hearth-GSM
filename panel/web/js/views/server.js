@@ -590,8 +590,11 @@ async function softwareTab(panel, ctx) {
       safeUrl(mp.icon_url) ? h("img", { class: "pack-icon lg", src: safeUrl(mp.icon_url), alt: "" }) : h("span", { class: "pack-icon lg" }),
       h("div", { class: "body" },
         h("div", { class: "t" }, mp.name),
-        h("div", { class: "faint mono", style: { fontSize: "12.5px" } }, `${mp.version_name} · MC ${mp.mc_version || "?"} · ${mp.provider}`)),
-      mp.auto_update ? h("span", { class: "badge ok" }, "Auto-update on") : h("span", { class: "badge" }, "Pinned"))
+        h("div", { class: "faint mono", style: { fontSize: "12.5px" } }, mp.uploaded
+          ? `${mp.version_name} · MC ${mp.mc_version || "?"} · ${mp.loader || "?"} · uploaded ${mp.provider} pack`
+          : `${mp.version_name} · MC ${mp.mc_version || "?"} · ${mp.provider}`)),
+      mp.uploaded ? h("span", { class: "badge" }, "Uploaded")
+        : mp.auto_update ? h("span", { class: "badge ok" }, "Auto-update on") : h("span", { class: "badge" }, "Pinned"))
     : h("div", { class: "picked" },
       h("div", { class: "body" },
         h("div", { class: "t" }, SOFTWARE.find(([k]) => k === s.variables.TYPE)?.[1] || s.variables.TYPE),
@@ -600,7 +603,7 @@ async function softwareTab(panel, ctx) {
   const updateRow = h("div", {});
   function drawUpdate() {
     const m = ctx.server().modpack;
-    if (!m) return;
+    if (!m || m.uploaded) return; // an uploaded zip has no catalog page to check for newer versions
     const check = h("button", { class: "btn sm", type: "button" }, icon("refresh"), "Check now");
     check.addEventListener("click", () => busy(check, async () => {
       const r = await post(`/servers/${s.id}/updates/check`);
@@ -623,7 +626,7 @@ async function softwareTab(panel, ctx) {
   }
 
   const editor = sourceEditor({
-    initial: mp
+    initial: mp && !mp.uploaded
       ? { kind: "modpack", modpack: { ...mp }, auto_update: mp.auto_update }
       : { kind: "software", server_type: s.variables.TYPE, version: s.variables.VERSION },
     allowLatest: false,

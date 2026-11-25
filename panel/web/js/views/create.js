@@ -108,9 +108,9 @@ export async function renderCreate(root, { query, navigate, setCrumbs, me }) {
     drawPresets();
     updateMemHint();
     if (template.features.includes("minecraft_java")) {
-      source = sourceEditor({ initial: prefillPack ? { kind: "modpack", modpack: prefillPack, auto_update: true } : { kind: "software" } });
+      source = sourceEditor({ initial: prefillPack ? { kind: "modpack", modpack: prefillPack, auto_update: true } : { kind: "software" }, allowUpload: true });
       replace(sourceSection,
-        h("header", {}, h("h2", {}, "Source"), h("p", {}, "Run plain Minecraft at any version, or install a modpack. Hearth picks the right Java for it.")),
+        h("header", {}, h("h2", {}, "Source"), h("p", {}, "Run plain Minecraft at any version, or install a modpack from the catalog or from a zip you downloaded. Hearth picks the right Java for it.")),
         source.el,
         presetList.length ? h("div", { class: "field", style: { maxWidth: "420px", marginTop: "16px" } }, h("label", { for: "starter" }, "Starter pack"), starter, starterHint) : null);
       sourceSection.hidden = false;
@@ -176,8 +176,9 @@ export async function renderCreate(root, { query, navigate, setCrumbs, me }) {
     };
     if (source) {
       const s = source.value();
-      if (!s) return toast("Choose a modpack, or switch back to server software.", "warn");
+      if (!s) return toast("Choose a modpack (or wait for the upload to finish), or switch back to server software.", "warn");
       if (s.kind === "software") Object.assign(body.variables, { TYPE: s.server_type, VERSION: s.version });
+      else if (s.kind === "upload") body.modpack_upload = s.modpack_upload;
       else Object.assign(body, { modpack: s.modpack, auto_update: s.auto_update });
       if (starter.value) {
         const p = presetList.find((x) => x.key === starter.value);

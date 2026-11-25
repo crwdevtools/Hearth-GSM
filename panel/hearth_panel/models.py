@@ -127,6 +127,9 @@ class Server(Base):
     modpack_version_id: Mapped[str | None] = mapped_column(String(64))
     modpack_version_name: Mapped[str | None] = mapped_column(String(255))
     modpack_mc_version: Mapped[str | None] = mapped_column(String(32))
+    # A pack uploaded as a zip: its path inside the server folder, and the loader it needs.
+    modpack_file: Mapped[str | None] = mapped_column(String(255))
+    modpack_loader: Mapped[str | None] = mapped_column(String(16))
     auto_update: Mapped[bool] = mapped_column(Boolean, default=False)
     update_version_id: Mapped[str | None] = mapped_column(String(64))
     update_version_name: Mapped[str | None] = mapped_column(String(255))

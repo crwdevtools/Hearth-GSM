@@ -268,7 +268,9 @@ export async function uploadFile(url, file, onProgress) {
     xhr.withCredentials = true;
     xhr.upload.onprogress = (e) => e.lengthComputable && onProgress?.(e.loaded / e.total);
     xhr.onload = () => {
-      if (xhr.status < 300) return resolve();
+      if (xhr.status < 300) {
+        try { return resolve(xhr.responseText ? JSON.parse(xhr.responseText) : null); } catch { return resolve(null); }
+      }
       let msg = `Upload failed (${xhr.status}).`;
       try { msg = JSON.parse(xhr.responseText).detail || msg; } catch { /* keep default */ }
       reject(new Error(msg));

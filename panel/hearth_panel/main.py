@@ -15,7 +15,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .config import Settings
 from .context import PanelContext
-from .routers import account, admin, auth, backups, catalog, files, mods, nodes, players, schedules, servers, sharing, users
+from .routers import account, admin, auth, backups, catalog, files, mods, nodes, packs, players, schedules, servers, sharing, users
 from .services import settings_store, updater
 from . import VERSION
 from .services import backups as backup_jobs
@@ -123,7 +123,7 @@ def create_app(context: PanelContext | None = None, *, run_updater: bool = True)
         return JSONResponse({"detail": f"{field}: {message}", "errors": errors}, status_code=422)
 
     for module in (auth, account, users, nodes, servers, files, backups, schedules, players, mods, sharing,
-                   catalog, admin):
+                   catalog, packs, admin):
         app.include_router(module.router)
 
     web = context.settings.web_dir

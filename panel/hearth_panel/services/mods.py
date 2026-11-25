@@ -47,7 +47,7 @@ async def target_for(ctx, server: Server) -> Target:
     if server.template != "minecraft-java":
         raise NotModdable("Mods and plugins are for Minecraft: Java servers.")
     if server.modpack_provider:
-        loaders: list[str] = []
+        loaders: list[str] = [server.modpack_loader] if server.modpack_loader else []
         if server.modpack_project_id:
             versions = await ctx.modpacks.versions(server.modpack_provider, server.modpack_project_id)
             current = next((v for v in versions if v["id"] == server.modpack_version_id), None)

@@ -4,6 +4,14 @@ Hearth uses [semantic versioning](https://semver.org/). Each release on GitHub c
 below for its version. Update with `git pull`, then run `start.sh` or `start.bat`; nodes on other
 machines need their agent updated too (Admin → Nodes says when one is behind).
 
+## Unreleased
+
+### Added
+- Create a server from a modpack zip you downloaded yourself (Modrinth `.mrpack` or CurseForge
+  `.zip`): Hearth reads the manifest, picks the right Java, and the image installs the loader, mods
+  and config on first start. Stopping a server that is still starting no longer waits out the
+  full stop timeout.
+
 ## 0.2.0
 
 ### Added

@@ -97,6 +97,8 @@ def server_out(server: Server, status: dict[str, Any] | None = None) -> dict[str
                 "version_id": server.modpack_version_id,
                 "version_name": server.modpack_version_name,
                 "mc_version": server.modpack_mc_version,
+                "uploaded": bool(server.modpack_file),
+                "loader": server.modpack_loader,
                 "auto_update": server.auto_update,
                 "update": (
                     {"id": server.update_version_id, "name": server.update_version_name}

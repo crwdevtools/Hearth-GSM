@@ -98,6 +98,8 @@ const FR = {
   "Search output…": "Rechercher…", "Type a command…": "Tapez une commande…", "Search Modrinth…": "Rechercher sur Modrinth…",
   "Secret access key": "Clé d'accès secrète", "Send test event": "Envoyer un événement de test", "Send": "Envoyer", "Server ID": "ID du serveur",
   "Server console output": "Sortie de la console", "Server files": "Fichiers du serveur", "Server not found": "Serveur introuvable",
+  "Upload zip": "Importer un zip", "Choose modpack file": "Choisir le fichier du modpack", "Choose a different file": "Choisir un autre fichier",
+  "CurseForge page (optional)": "Page CurseForge (facultatif)", "Uploaded": "Importé",
   "Server sections": "Sections du serveur", "Server software": "Logiciel serveur", "Server": "Serveur", "Servers they can create": "Serveurs qu'il peut créer",
   "Servers": "Serveurs", "Sessions": "Sessions", "Set up Hearth": "Configurer Hearth", "Set up two-factor sign-in": "Configurer la double authentification",
   "Settings saved.": "Réglages enregistrés.", "Settings": "Réglages", "Share with": "Partager avec", "Share": "Partager", "Sharing": "Partage",

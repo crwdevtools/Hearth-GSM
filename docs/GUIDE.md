@@ -244,6 +244,7 @@ can't skip the proxy. Players land on the first server you ticked.
   version needs: Java 8 for old versions, up to Java 21 and newer for current ones.
 - Or a **modpack**: search Modrinth or CurseForge and pick a version, or leave it on the newest.
   Tick **auto-update** to follow new releases ([section 7](#7-modpacks-and-automatic-updates)).
+- Or **Upload zip** for a modpack you downloaded yourself ([section 7](#uploading-a-modpack-zip)).
 
 **Resources**
 - **Memory**: the hard limit. The Java heap is sized inside it automatically ([section 1](#memory-is-sized-safely)).
@@ -458,6 +459,35 @@ already chosen.
 Without auto-update, servers still show an **update** badge, and you update from the Software
 tab when you're ready. An admin can run the check right away with **Check modpack updates now**
 on Admin → Overview, and change how often it runs in Admin → Settings.
+
+### Uploading a modpack zip
+
+If a pack can't be found in the catalog (or its author blocks third-party downloads), download it
+yourself and add it when creating the server: **Source → Upload zip**.
+
+- **Modrinth**: the pack's `.mrpack` file (Versions → the version → Download).
+- **CurseForge**: the pack's main file, a `.zip` with a `manifest.json` inside. Not the
+  "Server files" download, which is a finished server folder rather than a modpack.
+
+Upload it exactly as downloaded. Hearth reads only the small manifest to see which Minecraft
+version and mod loader (Forge, NeoForge, Fabric or Quilt) the pack needs, shows you what it found,
+and then creates the server with the right Java. The zip is copied to the server's folder as
+`modpack/pack.mrpack` (or `pack.zip`), and the Minecraft image unpacks it on first start: it
+installs the loader, downloads the mods the pack lists, and applies its config files. The first
+start can take several minutes.
+
+Things to know:
+- **CurseForge packs** are installed by the same tool as catalog packs, which wants the pack's
+  CurseForge page. Hearth guesses it from the pack's name; if the install can't find the pack,
+  paste its page address into the optional **CurseForge page** box. For Minecraft 1.17 and newer
+  no API key is needed; older packs need the key from Admin → Settings.
+- A mod whose author blocks third-party downloads can't be fetched automatically, so the install
+  stops and the console lists it under "Mods Need Download". Hearth doesn't yet offer a place to
+  drop those files (the Minecraft image expects them in a `/downloads` mount), so packs that need
+  them aren't supported for now.
+- Uploaded packs aren't checked for updates. To move to a newer version, create a new server from
+  the new file, or switch to a catalog pack under the Software tab.
+- An upload that isn't used to create a server is deleted after 6 hours.
 
 > Adding your own mods to a modpack server works, but the modpack installer may remove files
 > it doesn't know about when the pack updates. Keep a list of what you added.

@@ -29,6 +29,7 @@ class FakeAgent:
         self.jars: dict[str, dict[str, str]] = {}  # server uuid -> {file name: sha512} in mods/plugins
         self.files: dict[str, str] = {}
         self.copies: list[tuple[str, str]] = []
+        self.applies: list[tuple[str, str | None]] = []  # (server uuid, ?start= of each spec push)
         self.slept: list[tuple[str, str | None]] = []
         self.command_output = "ok"
         self.fail_backups = False
@@ -58,6 +59,7 @@ class FakeAgent:
         tail = "/".join(parts[4:])
         if method == "PUT" and not tail:
             self.specs[uuid] = json.loads(request.content)
+            self.applies.append((uuid, request.url.params.get("start")))
             return httpx.Response(202, json={"accepted": True})
         if method == "DELETE" and not tail:
             self.specs.pop(uuid, None)
@@ -143,6 +145,8 @@ class FakeAgent:
             self.commands.append((uuid, json.loads(request.content)["command"]))
             return httpx.Response(200, json={"output": self.command_output})
         if tail == "files" and method == "DELETE":
+            if self.files.pop(request.url.params.get("path", ""), None) is not None:
+                return httpx.Response(204)
             name = request.url.params.get("path", "").rsplit("/", 1)[-1]
             if self.jars.get(uuid, {}).pop(name, None) is None:
                 return httpx.Response(404, json={"detail": "Not found."})
@@ -342,7 +346,8 @@ def client(tmp_path, agent, public):
     agent.storage = public
     settings = Settings.from_env()
     settings = Settings(**{**settings.__dict__, "database_url": f"sqlite:///{tmp_path / 'test.db'}",
-                           "secret_key": "test-secret-" + "x" * 32, "curseforge_api_key": None})
+                           "secret_key": "test-secret-" + "x" * 32, "curseforge_api_key": None,
+                           "data_dir": tmp_path})
     context = PanelContext.build(settings, node_transport=httpx.MockTransport(agent),
                                  public_transport=httpx.MockTransport(public))
     context.resolver = fake_resolver

@@ -20,7 +20,9 @@ simpler to set up. It's written in Python and runs everything in Docker.
 - **Minecraft: Java Edition**: Vanilla, Paper, Purpur, Fabric, Quilt, Forge and NeoForge at
   **any version**. The version list is fetched live, and Hearth picks the right Java for it.
 - **Modpacks from Modrinth and CurseForge**: browse, deploy any pack at any version, and let
-  Hearth update servers to new releases automatically, taking a backup first.
+  Hearth update servers to new releases automatically, taking a backup first. A pack that isn't
+  in the catalog can be uploaded as the `.mrpack` or `.zip` you downloaded, and Hearth sets up
+  the right Java and mod loader for it.
 - **Single mods and plugins**: search Modrinth for ones that match the server's loader and
   version. Anything they require is installed too.
 - **Starter packs**: Paper with Geyser and Floodgate (Bedrock players join your Java server), or

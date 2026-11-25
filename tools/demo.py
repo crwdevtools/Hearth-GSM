@@ -90,7 +90,8 @@ def serve(app, port: int) -> None:
 def main() -> None:
     tmp = Path(tempfile.mkdtemp(prefix="hearth-demo-"))
     settings = Settings.from_env()
-    settings = Settings(**{**settings.__dict__, "database_url": f"sqlite:///{tmp / 'panel.db'}", "secret_key": None})
+    settings = Settings(**{**settings.__dict__, "database_url": f"sqlite:///{tmp / 'panel.db'}", "secret_key": None,
+                           "data_dir": tmp})
     context = PanelContext.build(settings, public_transport=httpx.MockTransport(catalog))
     serve(create_panel(context, run_updater=False), 8000)
     time.sleep(1.5)

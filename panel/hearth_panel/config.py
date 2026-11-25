@@ -31,6 +31,7 @@ class Settings:
     allow_remote_setup: bool = False
     allow_private_webhooks: bool = False
     breached_password_check: bool = True
+    data_dir: Path = Path("/var/lib/hearth-panel")
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -53,4 +54,5 @@ class Settings:
             allow_remote_setup=_bool("HEARTH_ALLOW_REMOTE_SETUP", False),
             allow_private_webhooks=_bool("HEARTH_ALLOW_PRIVATE_WEBHOOKS", False),
             breached_password_check=_bool("HEARTH_BREACHED_PASSWORD_CHECK", True),
+            data_dir=data_dir,
         )

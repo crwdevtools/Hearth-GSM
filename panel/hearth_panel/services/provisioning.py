@@ -9,7 +9,7 @@ from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from ..models import Allocation, Node, Server
-from ..templates import Template, TemplateError, defaults, get_template, parse_extra_env
+from ..templates import Template, TemplateError, defaults, get_template, parse_extra_env, parse_mc_version
 
 # Template variables the panel consumes itself instead of passing to the container.
 _PANEL_ONLY = {"IMAGE", "CONTAINER_PORT", "DATA_PATH", "EXTRA_ENV"}
@@ -128,7 +128,26 @@ def _ports(server: Server, template: Template, primary: Allocation, values: dict
     return ports, port_by_name
 
 
+UPLOADED_PACK_DIR = "modpack"
+
+
+def _uploaded_pack_env(server: Server, curseforge_key: str | None) -> dict[str, str]:
+    """A pack zip the person uploaded: the image installs it from the file in the server folder."""
+    path = f"/data/{server.modpack_file}"
+    if server.modpack_provider == "modrinth":
+        return {"TYPE": "MODRINTH", "MODRINTH_MODPACK": path}
+    env = {"TYPE": "AUTO_CURSEFORGE", "CF_MODPACK_ZIP": path, "CF_SLUG": server.modpack_slug or ""}
+    if curseforge_key:
+        env["CF_API_KEY"] = curseforge_key
+    elif (parse_mc_version(server.modpack_mc_version or "") or (0, 0, 0)) < (1, 17):
+        # Java 17+ images carry their own CurseForge key; the older ones don't.
+        raise ProvisionError("CurseForge packs for Minecraft before 1.17 need an API key. Add one in Admin → Settings.")
+    return env
+
+
 def _modpack_env(server: Server, curseforge_key: str | None) -> dict[str, str]:
+    if server.modpack_file:
+        return _uploaded_pack_env(server, curseforge_key)
     if server.modpack_provider == "modrinth":
         env = {"TYPE": "MODRINTH", "MODRINTH_MODPACK": server.modpack_project_id or ""}
         if server.modpack_version_id:

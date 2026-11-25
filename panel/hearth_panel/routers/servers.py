@@ -9,6 +9,7 @@ import json
 import logging
 import re
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
@@ -22,12 +23,12 @@ from ..deps import (admin_user, ctx, current_user, db_session, permissions_for, 
                     visible_servers_query, websocket_user)
 from ..models import Allocation, AuditLog, Node, Server, User
 from ..serializers import server_out
-from ..services import events, moves, presets, settings_store, updater
+from ..services import events, moves, packzip, presets, settings_store, updater
 from ..services import proxy as proxy_links
 from ..services.backups import BackupFailed, create_backup
 from ..services.events import is_discord_webhook
 from ..services.node_client import NodeError, console_ws_url
-from ..services.provisioning import ProvisionError, build_spec, check_capacity, choose_allocations, claim
+from ..services.provisioning import UPLOADED_PACK_DIR, ProvisionError, build_spec, check_capacity, choose_allocations, claim
 from ..services.status import live_statuses
 from ..templates import (MC_SERVER_TYPES, Template, TemplateError, coerce_variables, defaults, get_template,
                          parse_extra_env)
@@ -45,6 +46,12 @@ class ModpackChoice(BaseModel):
     version_id: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_\-]{1,64}$")  # None == latest release
 
 
+class PackUpload(BaseModel):
+    """A modpack zip uploaded beforehand (see routers/packs.py)."""
+    token: str = Field(pattern=r"^[A-Za-z0-9_\-]{16,43}$")
+    curseforge_page: str | None = Field(default=None, max_length=300)  # page address or slug, CurseForge packs only
+
+
 class ServerCreate(BaseModel):
     name: str = Field(min_length=1, max_length=64)
     description: str = Field(default="", max_length=500)
@@ -58,6 +65,7 @@ class ServerCreate(BaseModel):
     variables: dict[str, Any] = Field(default_factory=dict)
     allocation_id: int | None = None
     modpack: ModpackChoice | None = None
+    modpack_upload: PackUpload | None = None
     auto_update: bool = False
     accept_eula: bool = False
     start: bool = True
@@ -153,12 +161,56 @@ async def resolve_modpack(context: PanelContext, server: Server, choice: Modpack
             raise HTTPException(400, "That modpack version no longer exists.")
     else:
         version = next((v for v in versions if v["type"] == "release"), versions[0])
+    server.modpack_file = server.modpack_loader = None
     server.modpack_provider = choice.provider
     server.modpack_project_id = project["id"]
     server.modpack_slug = project["slug"]
     server.modpack_name = project["name"]
     server.modpack_icon = project["icon_url"]
     updater.set_modpack_version(server, version)
+
+
+def attach_upload(context: PanelContext, user: User, server: Server, choice: PackUpload) -> tuple[Path, str]:
+    """Fill the server's modpack fields from a staged zip. Returns the staged file and its name on the node."""
+    stage = packzip.stage_dir(context.settings.data_dir)
+    try:
+        path, meta = packzip.load(stage, choice.token, user.id)
+        slug = packzip.clean_slug(choice.curseforge_page)
+    except packzip.PackError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    info = meta["info"]
+    server.modpack_provider = info["format"]
+    server.modpack_project_id = server.modpack_icon = server.modpack_version_id = None
+    server.modpack_slug = (slug or info.get("slug")) if info["format"] == "curseforge" else None
+    server.modpack_name = info["name"]
+    server.modpack_version_name = info.get("version") or "uploaded"
+    server.modpack_mc_version = info["mc_version"]
+    server.modpack_loader = info["loader"]
+    server.modpack_file = f"{UPLOADED_PACK_DIR}/pack." + ("mrpack" if info["format"] == "modrinth" else "zip")
+    server.auto_update = False
+    return path, server.modpack_file
+
+
+async def _chunks(path: Path):
+    with path.open("rb") as fh:
+        while chunk := await asyncio.to_thread(fh.read, 1 << 20):
+            yield chunk
+
+
+async def deliver_pack(context: PanelContext, server: Server, path: Path, target: str) -> str | None:
+    """Copy the staged zip into the new server's folder (the node makes it moments after the apply)."""
+    error: NodeError | None = None
+    for attempt in range(20):
+        try:
+            await context.nodes.upload(server.node, server.uuid, target, _chunks(path), path.stat().st_size)
+            return None
+        except NodeError as exc:
+            error = exc
+            if exc.status not in (404, 409):
+                break
+            await asyncio.sleep(min(1.5, 0.2 * (attempt + 1)))
+    return (f"The server was created, but its modpack file didn't reach the node: {error}. "
+            "Delete it and create it again.")
 
 
 def _validate_template_vars(template: Template, values: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
@@ -242,7 +294,10 @@ async def create_server(body: ServerCreate, user: User = Depends(current_user), 
         raise HTTPException(400, "Accept the Minecraft EULA to create this server.")
     if body.memory_mb < template.min_memory_mb:
         raise HTTPException(400, f"{template.name} needs at least {template.min_memory_mb} MB of memory.")
-    if body.modpack and "modpacks" not in template.features:
+    has_pack = body.modpack is not None or body.modpack_upload is not None
+    if body.modpack and body.modpack_upload:
+        raise HTTPException(400, "Choose a modpack from the catalog or upload one, not both.")
+    if has_pack and "modpacks" not in template.features:
         raise HTTPException(400, f"{template.name} doesn't support modpacks.")
     if not user.is_admin and any(v.admin_only and k in body.variables
                                  for k in body.variables for v in template.variables if v.key == k):
@@ -258,7 +313,7 @@ async def create_server(body: ServerCreate, user: User = Depends(current_user), 
     preset = None
     if body.preset:
         try:
-            preset = presets.check(body.preset, template.key, variables, body.modpack is not None)
+            preset = presets.check(body.preset, template.key, variables, has_pack)
         except presets.PresetError as exc:
             raise HTTPException(400, str(exc)) from exc
     check_capacity(db, node, body.memory_mb, body.disk_mb)
@@ -268,8 +323,11 @@ async def create_server(body: ServerCreate, user: User = Depends(current_user), 
         template=template.key, memory_mb=body.memory_mb, swap_mb=body.swap_mb, cpu_percent=body.cpu_percent,
         disk_mb=body.disk_mb, variables=variables, auto_update=body.auto_update and body.modpack is not None,
     )
+    staged: tuple[Path, str] | None = None
     if body.modpack:
         await resolve_modpack(context, server, body.modpack)
+    elif body.modpack_upload:
+        staged = attach_upload(context, user, server, body.modpack_upload)
     picks = choose_allocations(node, template, body.allocation_id)
     db.add(server)
     db.flush()
@@ -286,7 +344,15 @@ async def create_server(body: ServerCreate, user: User = Depends(current_user), 
     db.refresh(server)
     events.emit(context, db, "server.created", server=server, user=user,
                 detail=f"{template.name} on {node.name}" + (f" ({preset.name})" if preset else ""))
-    if preset is None:
+    if staged:  # the pack goes in before the first start, which then installs it
+        warnings.append(await sync(context, db, server, start=False))
+        if not warnings[-1]:
+            warnings.append(await deliver_pack(context, server, *staged))
+            if not warnings[-1]:
+                packzip.discard(staged[0].parent, body.modpack_upload.token)
+                if body.start:
+                    warnings.append(await sync(context, db, server, start=True))
+    elif preset is None:
         warnings.append(await sync(context, db, server, start=body.start))
     else:  # plugins/mods go in before the first start
         warnings.append(await sync(context, db, server, start=False))
@@ -389,6 +455,7 @@ async def change_source(server_id: int, body: SourceBody, user: User = Depends(c
         except BackupFailed as exc:
             raise HTTPException(409, f"Not changed: the safety backup failed ({exc}). "
                                      "Untick “Back up first” to change anyway.") from exc
+    old_pack_file = server.modpack_file
     if body.kind == "modpack":
         if body.modpack is None:
             raise HTTPException(400, "Choose a modpack.")
@@ -401,7 +468,8 @@ async def change_source(server_id: int, body: SourceBody, user: User = Depends(c
             raise HTTPException(400, "Choose the server software.")
         server.variables = coerce_variables(template, {"TYPE": server_type, "VERSION": body.version or "LATEST"},
                                             base=dict(server.variables or {}))
-        for field in ("provider", "project_id", "slug", "name", "icon", "version_id", "version_name", "mc_version"):
+        for field in ("provider", "project_id", "slug", "name", "icon", "version_id", "version_name", "mc_version",
+                  "file", "loader"):
             setattr(server, f"modpack_{field}", None)
         server.update_version_id = server.update_version_name = None
         server.auto_update = False
@@ -410,6 +478,9 @@ async def change_source(server_id: int, body: SourceBody, user: User = Depends(c
                 detail=server.modpack_name and f"{server.modpack_name} {server.modpack_version_name}"
                 or f"{server.variables.get('TYPE')} {server.variables.get('VERSION')}")
     warning = await sync(context, db, server)
+    if old_pack_file and not server.modpack_file:  # the uploaded zip isn't needed any more
+        with contextlib.suppress(NodeError):
+            await context.nodes.delete_file(server.node, server.uuid, old_pack_file)
     return {**_out(server, user), "warning": warning}
 
 
@@ -653,6 +724,9 @@ async def apply_update(server: Server = Depends(server_with("settings")), user: 
                        db: Session = Depends(db_session), context: PanelContext = Depends(ctx)):
     if not server.modpack_provider:
         raise HTTPException(400, "This server doesn't run a modpack.")
+    if server.modpack_file:
+        raise HTTPException(400, "This modpack was uploaded, so Hearth can't check it for updates. "
+                                 "Create a new server from the newer file, or switch to a catalog modpack under Software.")
     result = await updater.check_server(context, db, server, apply=True)
     if result.get("error"):
         raise HTTPException(502, result["error"])
@@ -678,7 +752,8 @@ async def clone(server_id: int, body: CloneBody, user: User = Depends(current_us
                   node_id=source.node_id, template=source.template, memory_mb=source.memory_mb,
                   swap_mb=source.swap_mb, cpu_percent=source.cpu_percent, disk_mb=source.disk_mb,
                   variables=dict(source.variables or {}), auto_update=False)
-    for field in ("provider", "project_id", "slug", "name", "icon", "version_id", "version_name", "mc_version"):
+    for field in ("provider", "project_id", "slug", "name", "icon", "version_id", "version_name", "mc_version",
+                  "file", "loader"):
         setattr(copy, f"modpack_{field}", getattr(source, f"modpack_{field}"))
     picks = choose_allocations(source.node, template)
     db.add(copy)
@@ -689,7 +764,7 @@ async def clone(server_id: int, body: CloneBody, user: User = Depends(current_us
     db.commit()
     db.refresh(copy)
     warning = await sync(context, db, copy)
-    if body.copy_files and warning is None:
+    if (body.copy_files or source.modpack_file) and warning is None:  # an uploaded pack lives in the files
         for _ in range(60):  # wait for the node to finish creating the container
             st = (await live_statuses(context, [copy]))[copy.uuid]
             if st["state"] != "installing":
