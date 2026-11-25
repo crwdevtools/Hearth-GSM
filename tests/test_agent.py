@@ -4,7 +4,7 @@ import pytest
 
 from hearth_agent.files import FileAccessError, delete, list_dir, read_text, rename, write_text
 from hearth_agent.models import ServerSpec
-from hearth_agent.runtime import build_create_kwargs, cpu_percent_from_stats, memory_bytes_from_stats
+from hearth_agent.runtime import ServerManager, build_create_kwargs, cpu_percent_from_stats, memory_bytes_from_stats
 
 UUID = "0b9f6a2e-3c1d-4e5f-8a7b-6c5d4e3f2a1b"
 
@@ -88,3 +88,23 @@ def test_host_path_mapping():
     # The most specific mount wins.
     mounts.append({"Type": "bind", "Source": "/mnt/fast", "Destination": "/var/lib/hearth/servers"})
     assert host_path_for(mounts, root / "servers" / "x") == Path("/mnt/fast/x")
+
+
+class _Box:
+    def __init__(self, health=None, boom=False):
+        self.attrs = {"State": {"Health": {"Status": health}} if health else {"State": {}}}
+        self.boom = boom
+
+    def reload(self):
+        if self.boom:
+            raise RuntimeError("docker unavailable")
+
+
+def test_stop_wait_is_short_only_while_starting():
+    spec = ServerSpec(uuid=UUID, image="x", memory_mb=1024, stop_timeout=90)
+    assert ServerManager._stop_wait(_Box("starting"), spec) == 10
+    assert ServerManager._stop_wait(_Box("healthy"), spec) == 90
+    assert ServerManager._stop_wait(_Box(), spec) == 90  # no healthcheck: keep the clean shutdown
+    assert ServerManager._stop_wait(_Box(boom=True), spec) == 90
+    short = ServerSpec(uuid=UUID, image="x", memory_mb=1024, stop_timeout=5)
+    assert ServerManager._stop_wait(_Box("starting"), short) == 5  # never longer than the configured timeout
