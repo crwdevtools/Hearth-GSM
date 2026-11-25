@@ -403,9 +403,9 @@ class ServerManager:
                     if action == "start":
                         container.start()
                     elif action == "stop":
-                        container.stop(timeout=spec.stop_timeout)
+                        container.stop(timeout=self._stop_wait(container, spec))
                     elif action == "restart":
-                        container.restart(timeout=spec.stop_timeout)
+                        container.restart(timeout=self._stop_wait(container, spec))
             except Exception as exc:
                 st.error = _docker_error_text(exc)
                 log.warning("power %s on %s failed: %s", action, uuid, exc)
@@ -416,6 +416,18 @@ class ServerManager:
                 _end_transition(st, mine)
 
         threading.Thread(target=run, name=f"power-{uuid[:8]}", daemon=True).start()
+
+    @staticmethod
+    def _stop_wait(container, spec) -> int:
+        """Seconds to wait for a clean stop. A server that is still starting (a Forge or modpack
+        install, say) has no world to save and nothing listening for the shutdown signal, so
+        waiting the full timeout only makes the panel hang on "stopping"."""
+        try:
+            container.reload()
+            health = ((container.attrs.get("State") or {}).get("Health") or {}).get("Status")
+        except Exception:
+            return spec.stop_timeout
+        return min(spec.stop_timeout, 10) if health == "starting" else spec.stop_timeout
 
     # ----- console -----------------------------------------------------------------------
 
