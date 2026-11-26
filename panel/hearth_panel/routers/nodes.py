@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 
 from ..context import PanelContext
 from ..deps import admin_user, ctx, current_user, db_session
+from ..validation import clean_name
 from ..models import Allocation, Node, User
 from ..security import new_node_token
 from ..serializers import allocation_out, node_out
@@ -76,6 +77,8 @@ def check_agent_url(url: str | None, allow_insecure: bool) -> None:
 
 class NodeBody(NodePatch):
     name: str = Field(min_length=1, max_length=64)
+
+    _v_name = field_validator("name")(classmethod(lambda cls, v: clean_name(v)))
     location: str = Field(default="", max_length=64)
     url: str = Field(max_length=255)
     public_host: str = Field(min_length=1, max_length=255)

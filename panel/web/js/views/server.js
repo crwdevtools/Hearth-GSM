@@ -74,7 +74,7 @@ export async function renderServer(root, { params, query, me, navigate, setCrumb
   if (cleanup) cleanups.push(cleanup);
   if (tabKey === "console") {
     const stats = await statsSection(server);
-    panel.append(stats.el);
+    appendAll(panel, stats.el);
     cleanups.push(stats.stop);
   }
 
@@ -225,7 +225,7 @@ async function consoleTab(panel, ctx) {
       onclick: () => download(`/api/servers/${s.id}/files/download?path=${encodeURIComponent("/logs/latest.log")}`) }, icon("arrowdown"), "latest.log"),
     h("a", { class: "btn sm ghost", href: `#/servers/${s.id}/files?path=${encodeURIComponent("/crash-reports")}`, title: "Open the crash-reports folder" }, icon("file"), "Crash reports")]
     : [];
-  panel.append(h("div", { class: "console-grid" },
+  appendAll(panel, h("div", { class: "console-grid" },
     h("div", { class: "console" },
       h("div", { class: "console-bar" }, icon("search"), search, count, h("span", { class: "grow" }), ...logs),
       out, found, jump,
@@ -348,12 +348,12 @@ async function consoleTab(panel, ctx) {
   let draft = "";
 
   let reconnected = false;
+  let lastError = "";
   function connect() {
     ws = socket(`/servers/${s.id}/console`);
     let fresh = true;
-    ws.onopen = () => {
-      retry = 0;
-    };
+    // The panel accepts the socket before it knows the node answers, so a connection only counts as
+    // good (and resets the retry back-off) once the first log arrives; a dead node isn't retried every second.
     ws.onmessage = (event) => {
       let msg;
       try { msg = JSON.parse(event.data); } catch { return; }
@@ -362,10 +362,15 @@ async function consoleTab(panel, ctx) {
         // on screen rather than appending a second copy.
         if (fresh && reconnected) clearConsole();
         fresh = false;
+        retry = 0;
+        lastError = "";
         write(msg.data);
       }
-      else if (msg.type === "status") ctx.setStatus(msg.data);
-      else if (msg.type === "error") write(`${msg.data}\n`, "err");
+      else if (msg.type === "status") { retry = 0; ctx.setStatus(msg.data); }
+      else if (msg.type === "error" && msg.data !== lastError) {
+        lastError = msg.data;  // say it once, not on every retry
+        write(`${msg.data}\n`, "err");
+      }
     };
     ws.onclose = () => {
       if (closed) return;
@@ -471,7 +476,7 @@ async function filesTab(panel, ctx) {
       open(path);
     } catch (err) { fail(err); } finally { progress.textContent = ""; }
   });
-  panel.append(
+  appendAll(panel, 
     s.template.key === "minecraft-java"
       ? notice("info", "Settings managed under Properties overwrite matching keys in server.properties each time the server starts.")
       : null,
@@ -655,7 +660,7 @@ async function softwareTab(panel, ctx) {
       ctx.navigate(`/servers/${s.id}/console`);
     });
   });
-  panel.append(form);
+  appendAll(panel, form);
   drawUpdate();
 }
 
@@ -686,7 +691,7 @@ async function propertiesTab(panel, ctx) {
       await ctx.reload();
     });
   });
-  panel.append(form);
+  appendAll(panel, form);
 }
 
 // ----- network ----------------------------------------------------------------------------------
@@ -745,7 +750,7 @@ async function networkTab(panel, ctx) {
           h("div", { class: "table-wrap" }, h("table", { class: "board" },
             h("thead", {}, h("tr", {}, h("th", {}, "Address"), h("th", { class: "hide-sm" }, "Bind IP"), h("th", {}, "Role"), h("th", {}, h("span", { class: "sr-only" }, "Actions")))),
             h("tbody", {}, rows))))));
-    if (s.template.key === "velocity" && s.permissions.includes("settings")) panel.append(proxySection(s));
+    if (s.template.key === "velocity" && s.permissions.includes("settings")) appendAll(panel, proxySection(s));
   };
   draw();
 }
@@ -961,7 +966,7 @@ async function settingsTab(panel, ctx) {
     } catch (err) { replace(specBox, notice("bad", err.message)); }
   });
 
-  panel.append(details, integrations,
+  appendAll(panel, details, integrations,
     h("section", { class: "section" },
       h("header", {}, h("h2", {}, "Maintenance"), clone ? h("p", {}, "A copy gets its own port and starts stopped: a safe place to try updates or mods.") : null),
       h("div", { class: "section-body" },

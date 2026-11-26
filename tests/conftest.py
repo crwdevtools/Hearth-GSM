@@ -55,6 +55,8 @@ class FakeAgent:
             return httpx.Response(200, json=[{"uuid": u, "state": self.state, "history": [], **self.status_extra}
                                              for u in self.specs])
         parts = path.split("/")
+        if len(parts) < 4:
+            return httpx.Response(404)
         uuid = parts[3]
         tail = "/".join(parts[4:])
         if method == "PUT" and not tail:

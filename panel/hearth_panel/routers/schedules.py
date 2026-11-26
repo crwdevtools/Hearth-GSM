@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from ..context import PanelContext
 from ..deps import ctx, current_user, db_session, permissions_for, server_with
+from ..validation import clean_name
 from ..models import Schedule, Server, User
 from ..services import events
 from ..services.scheduler import Cron, CronError, describe_next, panel_timezone
@@ -20,6 +21,8 @@ access = server_with("schedules")
 
 class ScheduleBody(BaseModel):
     name: str = Field(min_length=1, max_length=64)
+
+    _v_name = field_validator("name")(classmethod(lambda cls, v: clean_name(v)))
     cron: str = Field(min_length=1, max_length=64)
     action: Literal["restart", "start", "stop", "backup", "command"]
     payload: str = Field(default="", max_length=500)

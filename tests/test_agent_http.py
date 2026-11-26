@@ -206,3 +206,63 @@ def test_console_history_arrives_in_one_message(agent):
     with agent.websocket_connect(f"/api/servers/{UUID}/console", headers=AUTH) as ws:
         first_log = next(m for m in (ws.receive_json() for _ in range(5)) if m["type"] == "log")
     assert "line 0\r\n" in first_log["data"] and "line 299\r\n" in first_log["data"]
+
+
+# ----- junk in, never a 500 ------------------------------------------------------------------------
+
+JUNK_PATHS = ["", "/", "../../etc/passwd", "..%2f..%2fetc", "a/../../b", "%00", "x" * 3000, "con", "a\\b", "//", "."]
+
+
+def test_agent_routes_never_500_on_junk(agent):
+    import re
+
+    assert agent.put(f"/api/servers/{UUID}", headers=AUTH, json=SPEC).status_code in (200, 201, 202, 204)
+    bad = []
+    spec = agent.app.openapi()
+    for path, ops in spec["paths"].items():
+        if "console" in path and "websocket" in path:
+            continue
+        for method in ops:
+            if method not in ("get", "post", "put", "patch", "delete"):
+                continue
+            for junk in JUNK_PATHS:
+                url = re.sub(r"\{uuid\}", UUID, path)
+                url = re.sub(r"\{[^}]+\}", "zz", url)
+                kwargs = {"headers": AUTH}
+                if method != "get":
+                    kwargs["json"] = {"path": junk, "name": junk, "target": junk, "to": junk, "content": junk, "command": junk, "url": junk}
+                if method == "get":
+                    kwargs["params"] = {"path": junk, "name": junk, "since": junk, "tail": junk}
+                if path.endswith("/power") or path.endswith("/delete") or "/api/servers/{uuid}" == path and method == "delete":
+                    continue
+                if method == "delete":
+                    kwargs["params"] = kwargs.pop("json")
+                r = getattr(agent, method)(url, **kwargs)
+                if r.status_code >= 500:
+                    bad.append((method, path, junk[:20], r.status_code, r.text[:100]))
+    assert not bad, "\n".join(map(str, bad[:12]))
+
+
+def test_agent_routes_never_500_on_odd_bodies(agent):
+    import re
+
+    agent.put(f"/api/servers/{UUID}", headers=AUTH, json=SPEC)
+    bad = []
+    for path, ops in agent.app.openapi()["paths"].items():
+        if path.endswith("/power") or "console" in path:
+            continue
+        for method in ("post", "put", "patch"):
+            if method not in ops:
+                continue
+            for body in (None, [], "x", 5, {"path": 5}, {"path": None, "name": None}, {"content": 10**20, "size": -1},
+                         {"env": {"A": None}, "memory_mb": "lots"}, {"ports": [{"host_port": 0}]}, {"archive": "../x", "target": "/"}):
+                url = re.sub(r"\{[^}]+\}", UUID if "uuid" in path else "zz", path)
+                kwargs = {"headers": AUTH}
+                if body is not None:
+                    kwargs["json"] = body
+                if path == "/api/servers/{uuid}" and method == "put":
+                    continue  # replaces the server the other requests use
+                r = getattr(agent, method)(url, **kwargs)
+                if r.status_code >= 500:
+                    bad.append((method, path, str(body)[:40], r.status_code, r.text[:80]))
+    assert not bad, "\n".join(map(str, bad[:12]))

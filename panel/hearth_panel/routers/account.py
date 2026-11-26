@@ -5,12 +5,13 @@ from __future__ import annotations
 import io
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..context import PanelContext
 from ..deps import ctx, current_user, db_session
+from ..validation import clean_name
 from ..models import ApiToken, User
 from ..security import new_api_token, match_totp, new_totp_secret, totp_uri, verify_password, verify_totp
 from ..services import events
@@ -29,6 +30,8 @@ class DisableBody(BaseModel):
 
 class TokenBody(BaseModel):
     name: str = Field(min_length=1, max_length=64)
+
+    _v_name = field_validator("name")(classmethod(lambda cls, v: clean_name(v)))
 
 
 def qr_svg(data: str) -> str | None:

@@ -588,7 +588,13 @@ def test_backups_go_off_site_in_parts_and_come_back(env, monkeypatch):
 
     from hearth_agent import backups as backups_mod
 
-    monkeypatch.setattr(backups_mod.time, "sleep", lambda _s: None)
+    import time as real_time
+    from types import SimpleNamespace
+
+    # Only the backup code skips its retry pauses; patching time.sleep itself would also turn this
+    # test's own polling into a busy loop that starves the worker threads on a loaded machine.
+    monkeypatch.setattr(backups_mod, "time", SimpleNamespace(sleep=lambda _s: None, time=real_time.time,
+                                                             monotonic=real_time.monotonic))
     storage = HTTPServer(("127.0.0.1", 0), _FakeStorage)
     threading.Thread(target=storage.serve_forever, daemon=True).start()
     base = f"http://127.0.0.1:{storage.server_port}"

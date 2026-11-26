@@ -6,6 +6,18 @@ machines need their agent updated too (Admin → Nodes says when one is behind).
 
 ## Unreleased
 
+### Fixed
+- A stray "null" printed on the Files, Backups and other tabs; tables no longer push the page
+  wider than a phone screen (they scroll instead).
+- Copy buttons now work when the panel is opened over plain http on the local network.
+- The console stops adding a red "can't reach the node" line (and stops retrying every second)
+  while a node is down.
+- A server that stopped while the panel was down no longer keeps counting playtime.
+- Names made only of spaces are refused for servers, nodes, schedules and API tokens; a file or
+  folder name over 255 bytes is refused instead of causing a server error on the node.
+- Statistics: network speeds under 1 byte/s no longer read "undefined", and switching the time
+  range no longer shows the previous range's window or an out-of-order reply.
+
 ### Added
 - Player counts now come from a Minecraft status ping, so an empty server no longer gets a `list`
   command (and a log line) every minute; `list` runs only when the count changes or every 5 minutes

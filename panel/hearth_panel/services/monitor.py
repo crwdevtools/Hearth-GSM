@@ -27,6 +27,7 @@ LOW_TPS_MINUTES = 5
 FILL_WARN_DAYS = 3
 TICKS_IDLE = 300  # seconds between tick-speed reads while nobody is online (every PLAYER_CHECK when someone is)
 READING_FRESH = 400  # seconds a player count or tick reading counts as current
+TICK_TIMEOUT = 12  # seconds for the whole tick-speed read of one server
 TICK_GIVE_UP = 3  # unreadable replies in a row before a server is left alone (an old version, say)
 NODE_CHECK = 60  # seconds between node health checks
 OFFLINE_AFTER = 2  # failed node checks in a row before "node offline" is announced
@@ -61,13 +62,15 @@ class Seen:
     mspt_off: bool = False
     metric_minute: int = 0
     low_tps_run: int = 0
+    ping_miss: int = 0
+    ping_skip_until: float = -1e9
     low_tps_sent: bool = False
     fill_checked: float = -1e9
     fill_sent: bool = False
 
 
 CARRIED = ("online", "online_at", "list_at", "max_players", "tps", "mspt", "ticks_at", "tick_cmd", "tick_miss", "tick_off",
-           "mspt_off", "metric_minute", "low_tps_run", "low_tps_sent", "fill_checked", "fill_sent")
+           "mspt_off", "metric_minute", "ping_miss", "ping_skip_until", "low_tps_run", "low_tps_sent", "fill_checked", "fill_sent")
 
 
 @dataclass
@@ -160,9 +163,14 @@ class Monitor:
         if state != "running":  # a restart may bring a different version: read the ticks afresh
             cur.online = cur.tps = cur.mspt = None
             cur.tick_miss, cur.tick_off, cur.mspt_off, cur.tick_cmd = 0, False, False, None
+            cur.ping_miss, cur.ping_skip_until = 0, -1e9
         self._check_disk(db, server, st, cur)
         if prev is None:
-            return  # first sight after a panel restart: no history to compare
+            # First sight after a panel restart: no history to compare. But a server that stopped while
+            # the panel was down must not keep sessions open (they would count playtime forever).
+            if state in ("offline", "sleeping", "missing") and "players" in get_template(server.template).features:
+                playtime.observe(db, server, None)
+            return
 
         emit = lambda action, detail="": events.emit(self.ctx, db, action, server=server, detail=detail)  # noqa: E731
         if ooms > prev.oom_kills:
@@ -210,7 +218,7 @@ class Monitor:
         if now - cur.last_player_check < PLAYER_CHECK:
             return
         cur.last_player_check = now
-        pinged = await self._ping(server)
+        pinged = await self._ping(server, cur, now)
         if pinged is not None and pinged[0] == cur.online == 0 and cur.players == [] and now - cur.online_at < READING_FRESH:
             # Still empty: no console command needed (keeps the server log quiet).
             cur.online_at, cur.max_players = now, pinged[1]
@@ -227,6 +235,11 @@ class Monitor:
         except NodeError:
             return
         if parsed is None:
+            if pinged is not None:
+                # A plugin that rewrites `list` (EssentialsX, say) leaves nothing to parse; the head-count
+                # still drives auto-sleep and the charts, only the names (and so playtime) are unknown.
+                cur.online, cur.online_at, cur.max_players, cur.last_count = pinged[0], now, pinged[1], pinged[0]
+                await self._track_ticks(server, cur, now)
             return
         cur.list_at = now
         cur.players = parsed[2]
@@ -235,12 +248,18 @@ class Monitor:
         playtime.observe(db, server, parsed[2])
         await self._track_ticks(server, cur, now)
 
-    async def _ping(self, server: Server) -> tuple[int, int] | None:
-        if server.template != "minecraft-java":
+    async def _ping(self, server: Server, cur: Seen, now: float) -> tuple[int, int] | None:
+        """Head-count from the status ping. A game port the panel can't reach (a firewall, say) is retried
+        only every 10 minutes after 3 misses, so it doesn't slow every sweep by the connect timeout."""
+        if server.template != "minecraft-java" or now < cur.ping_skip_until:
             return None
         port = next((a.port for a in server.allocations if a.is_primary), None) or (server.allocations[0].port if server.allocations else None)
         host = urlsplit(server.node.url).hostname
-        return await mcping.ping(host, port) if host and port else None
+        got = await mcping.ping(host, port) if host and port else None
+        cur.ping_miss = 0 if got else cur.ping_miss + 1
+        if cur.ping_miss >= 3:
+            cur.ping_skip_until, cur.ping_miss = now + 600, 2
+        return got
 
     async def _track_ticks(self, server: Server, cur: Seen, now: float) -> None:
         """TPS and tick time through the console: each minute with someone on, every few minutes without."""
@@ -249,6 +268,13 @@ class Monitor:
         if now - cur.ticks_at < (PLAYER_CHECK if cur.online else TICKS_IDLE):
             return
         cur.ticks_at = now
+        try:  # a console that hangs must not hold up the sweep for every other server
+            await asyncio.wait_for(self._read_ticks(server, cur), TICK_TIMEOUT)
+        except asyncio.TimeoutError:
+            cur.tick_miss += 1
+            cur.tick_off = cur.tick_miss >= TICK_GIVE_UP
+
+    async def _read_ticks(self, server: Server, cur: Seen) -> None:
         for command in ([cur.tick_cmd] if cur.tick_cmd else metrics.tick_commands(server)):
             try:
                 output = await self.ctx.nodes.command(server.node, server.uuid, command)

@@ -241,7 +241,7 @@ kbd {
 
 /* ----- leaderboard table ----- */
 
-.table-wrap { border-top: 1px solid var(--line); }
+.table-wrap { border-top: 1px solid var(--line); overflow-x: auto; }
 table.board { width: 100%; border-collapse: collapse; }
 .board th {
   text-align: left; font: 500 12px/1 var(--mono); color: var(--fg-faint); text-transform: uppercase; letter-spacing: 0.04em;

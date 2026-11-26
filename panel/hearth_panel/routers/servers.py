@@ -24,6 +24,7 @@ from ..deps import (admin_user, ctx, current_user, db_session, permissions_for, 
                     visible_servers_query, websocket_user)
 from ..models import Allocation, AuditLog, Node, Server, User
 from ..serializers import server_out
+from ..validation import clean_name
 from ..services import events, monitor, moves, packzip, presets, settings_store, updater
 from ..services import metrics as metric_series
 from ..services import proxy as proxy_links
@@ -73,6 +74,8 @@ class ServerCreate(BaseModel):
     start: bool = True
     preset: str | None = Field(default=None, max_length=32)
 
+    _v_name = field_validator("name")(classmethod(lambda cls, v: clean_name(v)))
+
 
 def _clean_address(v: str | None) -> str | None:
     if v is None:
@@ -97,6 +100,7 @@ class ServerPatch(BaseModel):
     auto_stop_minutes: int | None = Field(default=None, ge=0, le=1440)
     wake_on_join: bool | None = None
 
+    _v_name = field_validator("name")(classmethod(lambda cls, v: clean_name(v)))
     _v_addr = field_validator("public_address")(classmethod(lambda cls, v: _clean_address(v)))
 
     @field_validator("discord_webhook")
@@ -135,6 +139,8 @@ class SuspendBody(BaseModel):
 class CloneBody(BaseModel):
     name: str = Field(min_length=1, max_length=64)
     copy_files: bool = True
+
+    _v_name = field_validator("name")(classmethod(lambda cls, v: clean_name(v)))
 
 
 # ----- helpers ---------------------------------------------------------------------------------

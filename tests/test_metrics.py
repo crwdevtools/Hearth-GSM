@@ -178,3 +178,151 @@ def test_parse_realistic_replies():
     assert metrics.parse_ticks("tick query", vanilla) == (20.0, 2.9)
     forge = "Dim  0 (minecraft:overworld): Mean tick time: 5.1 ms. Mean TPS: 20.0\nOverall: Mean tick time: 5.8 ms. Mean TPS: 20.0"
     assert metrics.parse_ticks("forge tps", forge) == (20.0, 5.8)
+
+
+def test_deleting_a_server_removes_its_history(admin, node, agent):
+    sid = _create(admin, node)["id"]
+    _rows(admin, sid, [(int(time.time()) // 60 * 60 - 60, {"cpu": 1.0})])
+    assert admin.delete(f"/api/servers/{sid}").status_code in (200, 204)
+    with _db(admin) as db:
+        assert db.query(ServerMetric).filter_by(server_id=sid).count() == 0
+
+
+def _running(admin, agent):
+    original = agent.__call__
+
+    def patched(request):
+        if request.url.path == "/api/servers":
+            return httpx.Response(200, json=[{"uuid": u, "state": "running", "restarts": 0, "oom_kills": 0, "cpu": 5.0,
+                                              "memory": 1, "disk": 1, "network": {"rx": 1, "tx": 1}} for u in agent.specs])
+        return original(request)
+
+    admin.app.state.ctx.nodes.http._transport = httpx.MockTransport(patched)
+
+
+@pytest.mark.anyio
+async def test_empty_server_is_not_sent_list_every_minute(admin, node, agent, monkeypatch):
+    from hearth_panel.services import mcping
+
+    _create(admin, node)
+    _running(admin, agent)
+    answers = iter([(0, 20)] * 10)
+
+    async def fake_ping(host, port, timeout=3.0):
+        return next(answers)
+
+    monkeypatch.setattr(mcping, "ping", fake_ping)
+    agent.command_output = "There are 0 of a max of 20 players online:"
+    monitor = admin.app.state.monitor
+    for i in range(6):
+        await monitor.tick(now=i * 61)
+    lists = [c for _, c in agent.commands if c == "list"]
+    assert len(lists) == 1  # the first read; every later minute the ping alone says "still empty"
+
+
+@pytest.mark.anyio
+async def test_count_change_triggers_a_list(admin, node, agent, monkeypatch):
+    from hearth_panel.services import mcping
+
+    _create(admin, node)
+    _running(admin, agent)
+    counts = iter([(0, 20), (0, 20), (2, 20), (2, 20)])
+
+    async def fake_ping(host, port, timeout=3.0):
+        return next(counts)
+
+    monkeypatch.setattr(mcping, "ping", fake_ping)
+    monitor = admin.app.state.monitor
+    agent.command_output = "There are 0 of a max of 20 players online:"
+    await monitor.tick(now=0)
+    await monitor.tick(now=61)
+    agent.command_output = "There are 2 of a max of 20 players online: ann, bob"
+    await monitor.tick(now=122)
+    await monitor.tick(now=183)
+    lists = [c for _, c in agent.commands if c == "list"]
+    assert len(lists) == 2  # empty once, then once when the count rose; steady at 2 reuses the names
+    seen = next(iter(monitor.seen.values()))
+    assert seen.players == ["ann", "bob"] and seen.online == 2
+
+
+@pytest.mark.anyio
+async def test_unreachable_game_port_falls_back_to_list_and_backs_off(admin, node, agent, monkeypatch):
+    from hearth_panel.services import mcping
+
+    _create(admin, node)
+    _running(admin, agent)
+    calls = []
+
+    async def dead_ping(host, port, timeout=3.0):
+        calls.append(1)
+        return None
+
+    monkeypatch.setattr(mcping, "ping", dead_ping)
+    agent.command_output = "There are 0 of a max of 20 players online:"
+    monitor = admin.app.state.monitor
+    for i in range(8):
+        await monitor.tick(now=i * 61)
+    assert len([c for _, c in agent.commands if c == "list"]) == 7  # still counted through the console
+    assert len(calls) == 3  # then left alone for ten minutes
+
+
+@pytest.mark.anyio
+async def test_sessions_of_a_server_that_stopped_while_the_panel_was_down_are_closed(admin, node, agent):
+    from datetime import datetime, timezone
+
+    from hearth_panel.models import PlayerSession
+
+    sid = _create(admin, node)["id"]
+    with _db(admin) as db:
+        db.add(PlayerSession(server_id=sid, name="ghost", joined_at=datetime.now(timezone.utc)))
+        db.commit()
+    agent.state = "offline"
+    await admin.app.state.monitor.tick(now=0)  # the panel's first look: the server is offline
+    with _db(admin) as db:
+        assert db.query(PlayerSession).filter_by(server_id=sid, left_at=None).count() == 0
+
+
+@pytest.mark.anyio
+async def test_unreadable_list_reply_still_uses_the_ping(admin, node, agent, monkeypatch):
+    from hearth_panel.services import mcping
+
+    _create(admin, node)
+    _running(admin, agent)
+
+    async def fake_ping(host, port, timeout=3.0):
+        return (3, 50)
+
+    monkeypatch.setattr(mcping, "ping", fake_ping)
+    agent.command_output = "There are 3 out of maximum 50 players online.\nDefault: a, b, c"  # EssentialsX style
+    monitor = admin.app.state.monitor
+    await monitor.tick(now=0)
+    await monitor.tick(now=61)
+    seen = next(iter(monitor.seen.values()))
+    assert seen.online == 3 and seen.max_players == 50
+
+
+@pytest.mark.anyio
+async def test_a_hanging_console_is_given_up_on(admin, node, agent, monkeypatch):
+    import asyncio
+
+    from hearth_panel.services import mcping, monitor as monitor_mod
+
+    _create(admin, node)
+    _running(admin, agent)
+
+    async def ping(host, port, timeout=3.0):
+        return (1, 20)
+
+    async def slow(node, uuid, command):
+        if command == "list":
+            return "There are 1 of a max of 20 players online: ann"
+        await asyncio.sleep(5)  # the tick-speed commands hang
+
+    monkeypatch.setattr(mcping, "ping", ping)
+    monkeypatch.setattr(monitor_mod, "TICK_TIMEOUT", 0.05)
+    monitor = admin.app.state.monitor
+    monkeypatch.setattr(monitor.ctx.nodes, "command", slow)
+    for i in range(8):
+        await monitor.tick(now=i * 61)
+    seen = next(iter(monitor.seen.values()))
+    assert seen.tick_off is True

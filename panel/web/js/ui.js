@@ -5,7 +5,7 @@ import { h, icon, replace } from "./dom.js";
 // ----- formatters -------------------------------------------------------------------------------
 
 export function bytes(n, digits = 1) {
-  if (!n || n < 0) return "0 B";
+  if (!n || n < 1) return "0 B";  // also fractions of a byte (average rates), which would index before "B"
   const units = ["B", "KB", "MB", "GB", "TB"];
   const i = Math.min(Math.floor(Math.log(n) / Math.log(1024)), units.length - 1);
   const v = n / 1024 ** i;
@@ -155,12 +155,30 @@ export function promptDialog({ title, label, value = "", confirm = "Save", hint 
 
 // ----- small components -------------------------------------------------------------------------
 
+// navigator.clipboard only exists on https and localhost; a panel opened over plain http on the LAN
+// (http://192.168.x.x:8000) needs the older selection-based copy.
+async function copyText(text) {
+  if (navigator.clipboard && window.isSecureContext) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  const box = h("textarea", { readonly: "", "aria-hidden": "true", tabindex: "-1", style: { position: "fixed", top: "0", left: "-9999px", opacity: "0" } });
+  box.value = text;
+  document.body.append(box);
+  box.select();
+  try {
+    if (!document.execCommand("copy")) throw new Error("copy refused");
+  } finally {
+    box.remove();
+  }
+}
+
 export function copyButton(text, label = "Copy") {
   const btn = h("button", { class: "btn sm ghost icon-only", type: "button", title: label, "aria-label": label }, icon("copy"));
   btn.addEventListener("click", async (e) => {
     e.stopPropagation();
     try {
-      await navigator.clipboard.writeText(typeof text === "function" ? text() : text);
+      await copyText(typeof text === "function" ? text() : text);
       replace(btn, icon("check"));
       setTimeout(() => replace(btn, icon("copy")), 1400);
     } catch {

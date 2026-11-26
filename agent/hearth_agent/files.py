@@ -55,6 +55,8 @@ def split(relative: str) -> list[str]:
     parts = [p for p in relative.replace("\\", "/").split("/") if p not in ("", ".")]
     if ".." in parts:
         raise FileAccessError(OUTSIDE, 403)
+    if any(len(p.encode("utf-8", "surrogateescape")) > 255 for p in parts):
+        raise FileAccessError("A file or folder name can't be longer than 255 bytes.", 400)
     return parts
 
 

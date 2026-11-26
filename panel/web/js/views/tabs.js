@@ -1,7 +1,7 @@
 // Server tabs added with backups, schedules, players, mods, sharing and activity.
 
 import { del, get, patch, post, put } from "../api.js";
-import { h, icon, replace } from "../dom.js";
+import { appendAll, h, icon, replace } from "../dom.js";
 import {
   ago, busy, bytes, compact, confirmDialog, download, emptyRow, fail, field, notice, safeUrl, section,
   skeletonRows, toast, when,
@@ -51,13 +51,17 @@ export async function statsSection(server) {
     return b;
   }));
   const col = (pts, key) => pts.map((p) => ({ t: p.t, v: p.gap ? null : p[key] ?? null }));
-  const seconds = RANGES.find(([k]) => k === range)[2];
+  let drawing = 0;  // only the newest request may paint (a slow 7-day reply mustn't overwrite a 1-hour view)
 
   async function draw() {
+    const mine = ++drawing, asked = range;
+    const seconds = RANGES.find(([k]) => k === asked)[2];
     let d;
     try {
-      d = await get(`/servers/${server.id}/series`, { range });
+      d = await get(`/servers/${server.id}/series`, { range: asked });
+      if (mine !== drawing) return;
     } catch {
+      if (mine !== drawing) return;
       replace(grid, h("p", { class: "faint" }, "Stats are unavailable right now."));
       replace(tiles); replace(events); replace(recent);
       return;
@@ -103,6 +107,7 @@ export async function statsSection(server) {
       // A fresh install has no stored history yet: fall back to the node's own recent samples.
       try {
         const m = await get(`/servers/${server.id}/metrics`);
+        if (mine !== drawing) return;
         const minutes = m.minutes.length >= 2 ? m.minutes : m.recent;
         charts.push(lineChart({ title: "Memory", points: minutes.map((p) => ({ t: p.t, v: p.mem })), format: (v) => bytes(v), limit: m.memory_limit, step: 1024 ** 3 }),
           lineChart({ title: "CPU", points: minutes.map((p) => ({ t: p.t, v: p.cpu })), format: (v) => `${Math.round(v)}%`, limit: m.cpu_limit }));
@@ -220,7 +225,7 @@ export async function backupsTab(panel, ctx) {
     toast("Backup started. Saving is paused briefly so the world file is consistent.");
     load();
   }));
-  panel.append(
+  appendAll(panel, 
     h("div", { class: "toolbar" }, name, create, h("span", { class: "grow" }),
       h("span", { class: "faint", style: { fontSize: "13px" } }, "Hearth also backs up automatically before modpack updates, version changes and restores.")),
     table([{ label: "Backup" }, { label: "State" }, { label: "Size", cls: "right hide-sm" }, { label: "", cls: "hide-md" }, { label: h("span", { class: "sr-only" }, "Actions") }], tbody));
@@ -325,7 +330,7 @@ export async function schedulesTab(panel, ctx) {
     PRESETS.map((p) => h("button", { class: "btn sm", type: "button", onclick: () => openForm(null, p) }, p.label)),
     h("button", { class: "btn sm ghost", type: "button", onclick: () => openForm() }, icon("plus"), "Custom"));
 
-  panel.append(list, formBox);
+  appendAll(panel, list, formBox);
   replace(formBox, presetsRow());
   await load();
 }
@@ -335,7 +340,7 @@ export async function schedulesTab(panel, ctx) {
 export async function playersTab(panel, ctx) {
   const s = ctx.server();
   const body = h("div", {});
-  panel.append(body);
+  appendAll(panel, body);
 
   async function act(action, name, extra = {}) {
     await post(`/servers/${s.id}/players`, { action, name, ...extra });
@@ -467,7 +472,7 @@ export async function modsTab(panel, ctx) {
     replace(panel, notice("info", err.message));
     return;
   }
-  panel.append(installed, section(`Add ${target.kind === "plugin" ? "plugins" : "mods"}`,
+  appendAll(panel, installed, section(`Add ${target.kind === "plugin" ? "plugins" : "mods"}`,
     "Only versions that match this server's loader and Minecraft version are shown. Required dependencies are installed too, unless they're already there.",
     h("label", { class: "search", style: { maxWidth: "none" } }, icon("search"), search), results));
   runSearch();
@@ -514,7 +519,7 @@ export async function sharingTab(panel, ctx) {
       load();
     });
   });
-  panel.append(section("Sharing", "Give friends access to this server without making them admins.", form, body));
+  appendAll(panel, section("Sharing", "Give friends access to this server without making them admins.", form, body));
   await load();
 }
 
@@ -531,5 +536,5 @@ export function activityList(rows, { showServer = false } = {}) {
 }
 
 export async function activityTab(panel, ctx) {
-  panel.append(activityList(await get(`/servers/${ctx.server().id}/activity`)));
+  appendAll(panel, activityList(await get(`/servers/${ctx.server().id}/activity`)));
 }
