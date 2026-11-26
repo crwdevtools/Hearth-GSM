@@ -1,5 +1,5 @@
 import { get } from "../api.js";
-import { h, icon, replace } from "../dom.js";
+import { h, icon, replace, appendAll } from "../dom.js";
 import { activityBars, copyButton, fail, mb, bytes, safeUrl, skeletonRows, status, wordmark } from "../ui.js";
 
 const FILTERS = [
@@ -36,7 +36,7 @@ export async function renderDashboard(root, { me, navigate }) {
     draw();
   });
 
-  root.append(
+  appendAll(root, 
     h("section", { class: "hero" },
       wordmark(),
       h("p", { class: "hero-tag" }, "Every game server you run, in one place."),

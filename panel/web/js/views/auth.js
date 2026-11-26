@@ -1,5 +1,5 @@
 import { post } from "../api.js";
-import { h } from "../dom.js";
+import { h, appendAll } from "../dom.js";
 import { busy, field, wordmark } from "../ui.js";
 
 export function renderAuth(root, { needsSetup, setupAllowed = true, onDone }) {
@@ -52,7 +52,7 @@ export function renderAuth(root, { needsSetup, setupAllowed = true, onDone }) {
     });
   });
 
-  root.append(
+  appendAll(root, 
     h("div", { class: "auth view" },
       h("div", { class: "auth-card" },
         wordmark(),

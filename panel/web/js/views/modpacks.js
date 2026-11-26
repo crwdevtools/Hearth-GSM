@@ -1,7 +1,7 @@
 // Modpack leaderboard: Modrinth and CurseForge, live from their APIs.
 
 import { get } from "../api.js";
-import { h, icon, replace } from "../dom.js";
+import { h, icon, replace, appendAll } from "../dom.js";
 import { ago, compact, fail, notice, safeUrl, skeletonRows } from "../ui.js";
 
 const SORTS = [["downloads", "Most downloaded"], ["updated", "Recently updated"], ["newest", "Newest"]];
@@ -24,7 +24,7 @@ export async function renderModpacks(root, { me, setCrumbs }) {
   const more = h("div", { style: { display: "flex", justifyContent: "center", marginTop: "20px" } });
   const body = h("div", {});
 
-  root.append(
+  appendAll(root, 
     h("div", { class: "page-head" }, h("div", {},
       h("h1", {}, "Modpacks"),
       h("p", { class: "muted", style: { marginTop: "8px" } }, "Live from Modrinth and CurseForge. Deploy any pack at any version; Hearth tracks new releases."))),

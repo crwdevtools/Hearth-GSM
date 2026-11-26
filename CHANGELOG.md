@@ -7,6 +7,11 @@ machines need their agent updated too (Admin → Nodes says when one is behind).
 ## Unreleased
 
 ### Added
+- Console statistics: 1 h / 24 h / 7 d range switch; players online with the day's peak, TPS and
+  tick time (Paper `tps`, vanilla/Fabric/NeoForge `tick query`, Forge `forge tps`; a server that
+  doesn't answer is left alone), network speed, disk growth with a "fills in about N days" estimate,
+  restart and crash markers, and recent joins and leaves. History is kept for 8 days and charts
+  break where the server was off. JVM heap/GC and loaded chunks are not included yet.
 - Create a server from a modpack zip you downloaded yourself (Modrinth `.mrpack` or CurseForge
   `.zip`): Hearth reads the manifest, picks the right Java, and the image installs the loader, mods
   and config on first start. Stopping a server that is still starting no longer waits out the

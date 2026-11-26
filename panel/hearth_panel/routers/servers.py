@@ -8,12 +8,13 @@ import ipaddress
 import json
 import logging
 import re
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
-from fastapi import APIRouter, Depends, HTTPException, WebSocket
+from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -23,7 +24,8 @@ from ..deps import (admin_user, ctx, current_user, db_session, permissions_for, 
                     visible_servers_query, websocket_user)
 from ..models import Allocation, AuditLog, Node, Server, User
 from ..serializers import server_out
-from ..services import events, moves, packzip, presets, settings_store, updater
+from ..services import events, monitor, moves, packzip, presets, settings_store, updater
+from ..services import metrics as metric_series
 from ..services import proxy as proxy_links
 from ..services.backups import BackupFailed, create_backup
 from ..services.events import is_discord_webhook
@@ -556,6 +558,34 @@ async def metrics(server_id: int, user: User = Depends(current_user), db: Sessio
     server = server_for(server_id, user, db)
     data = await context.nodes.metrics(server.node, server.uuid)
     return {**data, "memory_limit": server.memory_mb * 1048576, "cpu_limit": server.cpu_percent or None}
+
+
+@router.get("/{server_id}/series")
+def series(server_id: int, request: Request, range: Literal["1h", "24h", "7d"] = "24h",
+           user: User = Depends(current_user), db: Session = Depends(db_session)):
+    """What the console charts draw: per-minute vitals, players, TPS, plus restarts and recent joins."""
+    server = server_for(server_id, user, db)
+    data = metric_series.series(db, server, range)
+    java = server.template == "minecraft-java"
+    seen = request.app.state.monitor.seen.get(server.id)
+    now = time.monotonic()
+    fresh = lambda at: seen is not None and at is not None and now - at < monitor.READING_FRESH  # noqa: E731
+    live = None
+    if java:
+        live = {"players": seen.online if seen and fresh(seen.online_at) else None,
+                "max_players": (seen.max_players if seen else None) or int((server.variables or {}).get("MAX_PLAYERS") or 20),
+                "names": list(seen.players) if seen and fresh(seen.online_at) else [],
+                "tps": seen.tps if seen and fresh(seen.ticks_at) else None,
+                "mspt": seen.mspt if seen and fresh(seen.ticks_at) else None,
+                "ticks_supported": not (seen and seen.tick_off)}
+    out = {**data, "now": live, "memory_limit": server.memory_mb * 1048576, "cpu_limit": server.cpu_percent or None,
+           "disk_limit": server.disk_mb * 1048576 if server.disk_mb else None,
+           "peak_24h": metric_series.peak_players(db, server) if java else None,
+           "events": metric_series.events_since(db, server, metric_series.RANGES[range][0]),
+           "recent": None}
+    if java and "players" in permissions_for(server, user):
+        out["recent"] = metric_series.recent_players(db, server)
+    return out
 
 
 @router.get("/{server_id}/activity")

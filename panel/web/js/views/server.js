@@ -1,5 +1,5 @@
 import { del, get, patch, post, put, socket } from "../api.js";
-import { h, icon, replace } from "../dom.js";
+import { h, icon, replace, appendAll } from "../dom.js";
 import {
   ago, busy, bytes, confirmDialog, copyButton, fail, field, mb, download, notice, promptDialog, safeUrl, status, uploadFile, statusLabel, suffixed, toast, uptime, warnIf,
 } from "../ui.js";
@@ -33,7 +33,7 @@ export async function renderServer(root, { params, query, me, navigate, setCrumb
   } catch (err) {
     if (err.status !== 404) throw err;
     setCrumbs([{ label: "Servers", href: "#/" }, { label: "Not found" }]);
-    root.append(h("div", { class: "empty" }, h("h2", {}, "Server not found"),
+    appendAll(root, h("div", { class: "empty" }, h("h2", {}, "Server not found"),
       h("p", {}, "It was deleted, or it isn't shared with you."), h("a", { class: "btn", href: "#/" }, "Back to servers")));
     return;
   }
@@ -65,7 +65,7 @@ export async function renderServer(root, { params, query, me, navigate, setCrumb
   const tabBar = h("div", { class: "tabs", role: "tablist", "aria-label": "Server sections" },
     tabs.map(([key, label]) => h("a", { class: "tab", role: "tab", href: `#/servers/${id}/${key}`, "aria-selected": String(key === tabKey) }, label)));
   const panel = h("div", { role: "tabpanel" });
-  root.append(head.el, tabBar, panel);
+  appendAll(root, head.el, tabBar, panel);
 
   const views = { console: consoleTab, files: filesTab, software: softwareTab, properties: propertiesTab, network: networkTab,
     settings: settingsTab, backups: backupsTab, schedules: schedulesTab, players: playersTab, mods: modsTab,
@@ -74,7 +74,7 @@ export async function renderServer(root, { params, query, me, navigate, setCrumb
   if (cleanup) cleanups.push(cleanup);
   if (tabKey === "console") {
     const stats = await statsSection(server);
-    panel.append(h("div", { class: "stats-head" }, h("h2", {}, "Last 24 hours")), stats.el);
+    panel.append(stats.el);
     cleanups.push(stats.stop);
   }
 

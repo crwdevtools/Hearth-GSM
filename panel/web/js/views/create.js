@@ -1,5 +1,5 @@
 import { get, post } from "../api.js";
-import { h, icon, replace } from "../dom.js";
+import { h, icon, replace, appendAll } from "../dom.js";
 import { busy, field, mb, notice, suffixed, toast } from "../ui.js";
 import { sourceEditor } from "./picker.js";
 import { variableFields } from "./vars.js";
@@ -15,12 +15,12 @@ export async function renderCreate(root, { query, navigate, setCrumbs, me }) {
     admin ? get("/users") : Promise.resolve([me]),
   ]);
 
-  root.append(h("div", { class: "page-head" },
+  appendAll(root, h("div", { class: "page-head" },
     h("div", {}, h("h1", {}, "New server"),
       h("p", { class: "muted", style: { marginTop: "8px" } }, "Pick a game and a node. Everything here can be changed later."))));
 
   if (!nodes.length) {
-    root.append(h("div", { class: "empty" },
+    appendAll(root, h("div", { class: "empty" },
       h("h2", {}, admin ? "Add a node first" : "No machines available"),
       h("p", {}, admin ? "Servers run on nodes. Add the machine you want to host on, then come back." : "Ask an admin to add a node."),
       admin ? h("a", { class: "btn primary", href: "#/admin/nodes/new" }, icon("plus"), "Add a node") : null));
@@ -111,8 +111,8 @@ export async function renderCreate(root, { query, navigate, setCrumbs, me }) {
       source = sourceEditor({ initial: prefillPack ? { kind: "modpack", modpack: prefillPack, auto_update: true } : { kind: "software" }, allowUpload: true });
       replace(sourceSection,
         h("header", {}, h("h2", {}, "Source"), h("p", {}, "Run plain Minecraft at any version, or install a modpack from the catalog or from a zip you downloaded. Hearth picks the right Java for it.")),
-        source.el,
-        presetList.length ? h("div", { class: "field", style: { maxWidth: "420px", marginTop: "16px" } }, h("label", { for: "starter" }, "Starter pack"), starter, starterHint) : null);
+        h("div", { class: "section-body" }, source.el,
+          presetList.length ? h("div", { class: "field", style: { maxWidth: "420px" } }, h("label", { for: "starter" }, "Starter pack"), starter, starterHint) : null));
       sourceSection.hidden = false;
     } else {
       source = null;
@@ -196,7 +196,7 @@ export async function renderCreate(root, { query, navigate, setCrumbs, me }) {
     });
   });
 
-  root.append(form);
+  appendAll(root, form);
   if (!firstUsable) root.prepend(notice("warn", "Every node is out of free ports. Add allocations under Admin → Nodes."));
   onTemplate();
   loadPorts();

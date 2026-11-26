@@ -6,7 +6,7 @@ import uuid as uuidlib
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import JSON, BigInteger, Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, false, text, true
+from sqlalchemy import JSON, BigInteger, Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, false, text, true
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.types import TypeDecorator
 
@@ -293,6 +293,25 @@ class Webhook(Base):
     secret: Mapped[str] = mapped_column(String(128))  # HMAC-SHA256 signing key
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow)
+
+
+class ServerMetric(Base):
+    """One minute of a running server's vitals, kept for a week to draw the console charts."""
+
+    __tablename__ = "server_metrics"
+    __table_args__ = (UniqueConstraint("server_id", "ts"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    server_id: Mapped[int] = mapped_column(ForeignKey("servers.id", ondelete="CASCADE"), index=True)
+    ts: Mapped[int] = mapped_column(Integer, index=True)  # unix seconds, on the minute
+    cpu: Mapped[float | None] = mapped_column(Float)
+    mem: Mapped[int | None] = mapped_column(BigInteger)
+    disk: Mapped[int | None] = mapped_column(BigInteger)
+    rx: Mapped[int | None] = mapped_column(BigInteger)  # network byte counters since the container started
+    tx: Mapped[int | None] = mapped_column(BigInteger)
+    players: Mapped[int | None] = mapped_column(Integer)
+    tps: Mapped[float | None] = mapped_column(Float)
+    mspt: Mapped[float | None] = mapped_column(Float)
 
 
 class PlayerSession(Base):

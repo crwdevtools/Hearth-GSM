@@ -1,7 +1,7 @@
 // Minecraft source editor: server software + version, or a modpack + version from Modrinth/CurseForge.
 
 import { get, del } from "../api.js";
-import { h, icon, replace } from "../dom.js";
+import { h, icon, replace, appendAll } from "../dom.js";
 import { bytes, compact, field, notice, safeUrl, uploadFile } from "../ui.js";
 
 export const SOFTWARE = [
@@ -56,7 +56,7 @@ export function sourceEditor({ initial, allowLatest = true, allowUpload = false,
   const kindSwitch = segmented(kinds, value.kind,
     (k) => { value.kind = k; drawBody(); changed(); }, "Source type");
   const body = h("div", { class: "section-body" });
-  root.append(kindSwitch, body);
+  appendAll(root, kindSwitch, body);
 
   // ----- software ------------------------------------------------------------------------------
   const versionSelect = h("select", { "aria-label": "Minecraft version" });

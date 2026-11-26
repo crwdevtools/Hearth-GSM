@@ -1,7 +1,7 @@
 // Admin area: Pterodactyl-style sidebar with overview, nodes, users, settings.
 
 import { del, get, patch, post, put } from "../api.js";
-import { h, icon, replace } from "../dom.js";
+import { h, icon, replace, appendAll } from "../dom.js";
 import { busy, bytes, confirmDialog, copyButton, download, emptyRow, fail, field, mb, notice, section, skeletonRows, suffixed, toast } from "../ui.js";
 import { activityList } from "./tabs.js";
 
@@ -13,7 +13,7 @@ export async function renderAdmin(root, ctx) {
   const key = SECTIONS.some(([k]) => k === section) ? section : "overview";
   ctx.setCrumbs([{ label: "Admin", href: "#/admin" }, { label: SECTIONS.find(([k]) => k === key)[1] }]);
   const content = h("div", { style: { minWidth: 0 } });
-  root.append(h("div", { class: "admin" },
+  appendAll(root, h("div", { class: "admin" },
     h("nav", { class: "side", "aria-label": "Admin" },
       h("span", { class: "group" }, "Admin"),
       SECTIONS.map(([k, label, ic]) => h("a", { href: `#/admin/${k}`, "aria-current": k === key ? "page" : null }, icon(ic), label))),
@@ -42,7 +42,7 @@ async function overview(root) {
   const update = data.update ? notice("info", h("span", {}, `Hearth ${data.update.version} is available (you have ${data.version}). `,
     data.update.url ? h("a", { class: "link", href: data.update.url, target: "_blank", rel: "noopener noreferrer" }, "What's new") : null,
     " · Update with git pull, then start.sh or start.bat.")) : null;
-  root.append(head("Overview", "What this panel manages."), update,
+  appendAll(root, head("Overview", "What this panel manages."), update,
     h("dl", { class: "facts", style: { fontSize: "14px" } },
       h("dt", {}, "Hearth"), h("dd", {}, `Version ${data.version}`),
       h("dt", {}, "Nodes"), h("dd", {}, h("a", { class: "link", href: "#/admin/nodes" }, data.nodes)),
@@ -58,7 +58,7 @@ async function overview(root) {
 
 async function nodeList(root, { navigate }) {
   const tbody = h("tbody", {}, skeletonRows(5, 2));
-  root.append(
+  appendAll(root, 
     head("Nodes", "Machines that run servers. Each runs the Hearth agent next to Docker — your own box, a VPS, or a dedicated server from any provider.",
       h("a", { class: "btn primary", href: "#/admin/nodes/new" }, icon("plus"), "Add node")),
     h("div", { class: "table-wrap" }, h("table", { class: "board" },
@@ -127,7 +127,7 @@ async function nodeCreate(root, { navigate }) {
         h("div", { class: "toolbar" }, h("a", { class: "btn primary", href: `#/admin/nodes/${node.id}` }, "Next: add ports")));
     });
   });
-  root.append(head("Add a node", "Any machine with Docker can be a node: the one running Hearth, a spare PC, or a server rented from any provider."), el);
+  appendAll(root, head("Add a node", "Any machine with Docker can be a node: the one running Hearth, a spare PC, or a server rented from any provider."), el);
 }
 
 async function nodeDetail(root, { navigate }, id) {
@@ -196,7 +196,7 @@ async function nodeDetail(root, { navigate }, id) {
     navigate("/admin/nodes");
   }));
 
-  root.append(
+  appendAll(root, 
     h("div", { class: "page-head" }, h("div", {}, h("h1", {}, node.name),
       h("div", { class: "meta" }, status, h("span", { class: "mono", style: { fontSize: "13px" } }, node.url), node.location ? h("span", {}, node.location) : null))),
     outdated,
@@ -276,7 +276,7 @@ async function userList(root, { me }) {
     }));
   }
 
-  root.append(head("Users", "Friends who can sign in. They see servers they own or that are shared with them. Give them a quota to let them create their own."), form,
+  appendAll(root, head("Users", "Friends who can sign in. They see servers they own or that are shared with them. Give them a quota to let them create their own."), form,
     h("div", { class: "table-wrap" }, h("table", { class: "board" },
       h("thead", {}, h("tr", {}, h("th", {}, "User"), h("th", {}, "Role"), h("th", { class: "hide-md" }, "Quota (servers · MB)"), h("th", {}, h("span", { class: "sr-only" }, "Actions")))), tbody)));
   await load();
@@ -285,7 +285,7 @@ async function userList(root, { me }) {
 // ----- activity ---------------------------------------------------------------------------------
 
 async function activity(root) {
-  root.append(head("Activity", "Everything that happened: who did what, and what Hearth did on its own (updates, crashes, schedules)."),
+  appendAll(root, head("Activity", "Everything that happened: who did what, and what Hearth did on its own (updates, crashes, schedules)."),
     activityList(await get("/admin/activity"), { showServer: true }));
 }
 
@@ -363,7 +363,7 @@ async function settings(root) {
       replace(root); settings(root);
     });
   });
-  root.append(head("Settings"), form, await offsiteSection(), await panelBackupSection(), await webhooksSection());
+  appendAll(root, head("Settings"), form, await offsiteSection(), await panelBackupSection(), await webhooksSection());
 }
 
 async function offsiteSection() {

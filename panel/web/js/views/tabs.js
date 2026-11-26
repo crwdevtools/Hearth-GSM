@@ -13,24 +13,121 @@ const table = (head, body) => h("div", { class: "table-wrap" }, h("table", { cla
 
 // ----- stats (console page) ----------------------------------------------------------------------
 
+const RANGES = [["1h", "1 h", 3600], ["24h", "24 h", 86400], ["7d", "7 days", 7 * 86400]];
+const EVENT_LABEL = { "server.started": "Started", "server.stopped": "Stopped", "server.crashed": "Crashed",
+  "server.out_of_memory": "Ran out of memory", "server.crash_loop": "Crash loop" };
+const rate = (v) => `${bytes(v || 0)}/s`;
+const clock = (t) => new Date(t * 1000).toLocaleString([], { hour: "numeric", minute: "2-digit", ...(Date.now() / 1000 - t > 72000 ? { weekday: "short" } : {}) });
+const span = (sec) => sec >= 3600 ? `${Math.floor(sec / 3600)} h ${Math.round((sec % 3600) / 60)} min` : `${Math.max(1, Math.round(sec / 60))} min`;
+
+/** Days until `limit` bytes are used, from the slope of the disk readings; null when it isn't growing. */
+function fillEstimate(points, limit) {
+  const pts = points.filter((p) => p.v != null);
+  if (!limit || pts.length < 6) return null;
+  const n = pts.length, mt = pts.reduce((a, p) => a + p.t, 0) / n, mv = pts.reduce((a, p) => a + p.v, 0) / n;
+  const den = pts.reduce((a, p) => a + (p.t - mt) ** 2, 0);
+  if (!den) return null;
+  const slope = pts.reduce((a, p) => a + (p.t - mt) * (p.v - mv), 0) / den; // bytes per second
+  if (slope <= 0 || pts.at(-1).t - pts[0].t < 1800) return null;
+  const left = limit - pts.at(-1).v;
+  return { perDay: slope * 86400, days: left > 0 ? left / slope / 86400 : 0 };
+}
+
 export async function statsSection(server) {
-  const box = h("div", { class: "chart-grid" });
-  const draw = async () => {
+  let range = sessionStorage.getItem("hearth.range") || "24h";
+  if (!RANGES.some(([k]) => k === range)) range = "24h";
+  const tiles = h("dl", { class: "tiles" });
+  const grid = h("div", { class: "chart-grid" });
+  const events = h("div", {});
+  const recent = h("div", {});
+  const switcher = h("div", { class: "segmented", role: "group", "aria-label": "Time range" });
+  const head = h("div", { class: "stats-head" }, h("h2", {}, "Statistics"), switcher);
+  const root = h("div", {}, head, tiles, grid, events, recent);
+  const tile = (label, value, sub) => h("div", { class: "stat" }, h("dt", {}, label),
+    h("dd", {}, value, sub ? h("small", {}, ` ${sub}`) : null));
+  const drawSwitch = () => replace(switcher, RANGES.map(([k, label]) => {
+    const b = h("button", { type: "button", "aria-pressed": String(k === range) }, label);
+    b.addEventListener("click", () => { range = k; try { sessionStorage.setItem("hearth.range", k); } catch { /* private mode */ } drawSwitch(); draw(); });
+    return b;
+  }));
+  const col = (pts, key) => pts.map((p) => ({ t: p.t, v: p.gap ? null : p[key] ?? null }));
+  const seconds = RANGES.find(([k]) => k === range)[2];
+
+  async function draw() {
+    let d;
     try {
-      const m = await get(`/servers/${server.id}/metrics`);
-      const minutes = m.minutes.length >= 2 ? m.minutes : m.recent;
-      replace(box,
-        lineChart({ title: "Memory · last 24 h", points: minutes.map((p) => ({ t: p.t, v: p.mem })),
-          format: (v) => bytes(v), limit: m.memory_limit, step: 1024 ** 3 }),
-        lineChart({ title: "CPU · last 24 h", points: minutes.map((p) => ({ t: p.t, v: p.cpu })),
-          format: (v) => `${Math.round(v)}%`, limit: m.cpu_limit }));
+      d = await get(`/servers/${server.id}/series`, { range });
     } catch {
-      replace(box, h("p", { class: "faint" }, "Stats are unavailable while the node is unreachable."));
+      replace(grid, h("p", { class: "faint" }, "Stats are unavailable right now."));
+      replace(tiles); replace(events); replace(recent);
+      return;
     }
-  };
+    const pts = d.points;
+    const to = Math.floor(Date.now() / 1000), from = to - seconds;
+    const marks = d.events.filter((e) => e.action !== "server.stopped").map((e) => ({ t: e.t, kind: e.action === "server.started" ? "start" : "bad" }));
+    const common = { from, to, marks };
+    const has = (key) => pts.some((p) => p[key] != null);
+    const n = d.now;
+    const last = (key) => [...pts].reverse().find((p) => p[key] != null)?.[key];
+
+    // Tiles: only what this game reports.
+    const fill = fillEstimate(col(pts, "disk"), d.disk_limit);
+    const out = [];
+    if (n) {
+      out.push(tile("Players", n.players == null ? "—" : String(n.players), n.players == null ? "" : `/ ${n.max_players}`));
+      if (n.ticks_supported) out.push(tile("TPS", n.tps == null ? "—" : n.tps.toFixed(1), n.mspt == null ? "" : `${n.mspt.toFixed(1)} ms/tick`));
+    }
+    if (has("rx") || has("tx")) out.push(tile("Network", `↓ ${rate(last("rx"))}`, `↑ ${rate(last("tx"))}`));
+    if (fill) out.push(tile("Disk fills", fill.days > 365 ? "> 1 year" : fill.days < 1 ? "< 1 day" : `~${Math.round(fill.days)} d`, `+${bytes(fill.perDay)}/day`));
+    replace(tiles, out);
+
+    const charts = [];
+    if (n && has("players")) {
+      charts.push(lineChart({ ...common, title: `Players online${d.peak_24h != null ? ` · peak ${d.peak_24h} (24 h)` : ""}`, points: col(pts, "players"),
+        format: (v) => String(Math.round(v)), max: Math.max(5, Math.ceil(Math.max(d.peak_24h || 0, ...pts.map((p) => p.players || 0)) * 1.2)) }));
+    }
+    if (n && n.ticks_supported && has("tps")) {
+      charts.push(lineChart({ ...common, title: "TPS (20 is perfect)", points: col(pts, "tps"), format: (v) => v.toFixed(1), max: 20,
+        tipExtra: (p) => { const m = pts.find((q) => q.t === p.t)?.mspt; return m != null ? `${m.toFixed(1)} ms/tick` : ""; } }));
+    }
+    if (has("rx") || has("tx")) {
+      charts.push(lineChart({ ...common, title: "Network in", points: col(pts, "rx"), format: rate }));
+      charts.push(lineChart({ ...common, title: "Network out", points: col(pts, "tx"), format: rate }));
+    }
+    if (has("disk")) {
+      charts.push(lineChart({ ...common, title: "Disk used", points: col(pts, "disk"), format: (v) => bytes(v), limit: d.disk_limit }));
+    }
+    if (has("cpu")) charts.push(lineChart({ ...common, title: "CPU", points: col(pts, "cpu"), format: (v) => `${Math.round(v)}%`, limit: d.cpu_limit }));
+    if (has("mem")) charts.push(lineChart({ ...common, title: "Memory", points: col(pts, "mem"), format: (v) => bytes(v), limit: d.memory_limit, step: 1024 ** 3 }));
+    if (!charts.length) {
+      // A fresh install has no stored history yet: fall back to the node's own recent samples.
+      try {
+        const m = await get(`/servers/${server.id}/metrics`);
+        const minutes = m.minutes.length >= 2 ? m.minutes : m.recent;
+        charts.push(lineChart({ title: "Memory", points: minutes.map((p) => ({ t: p.t, v: p.mem })), format: (v) => bytes(v), limit: m.memory_limit, step: 1024 ** 3 }),
+          lineChart({ title: "CPU", points: minutes.map((p) => ({ t: p.t, v: p.cpu })), format: (v) => `${Math.round(v)}%`, limit: m.cpu_limit }));
+      } catch { charts.push(h("p", { class: "faint" }, "Stats are unavailable while the node is unreachable.")); }
+    }
+    replace(grid, charts);
+
+    // Restarts and crashes, newest first.
+    replace(events, d.events.length ? h("div", { class: "section-body" },
+      h("h3", { class: "mini-head" }, "Restarts and crashes"),
+      h("ul", { class: "event-list" }, d.events.slice(0, 8).map((e) => h("li", {},
+        h("span", { class: `dot ${e.action === "server.started" || e.action === "server.stopped" ? "" : "bad"}`, "aria-hidden": "true" }),
+        h("span", {}, EVENT_LABEL[e.action] || e.action), h("span", { class: "faint" }, clock(e.t)))))) : null);
+
+    const r = d.recent;
+    replace(recent, r && (r.recent.length || r.longest_session) ? h("div", { class: "section-body" },
+      h("h3", { class: "mini-head" }, "Joins and leaves", r.longest_session ? h("small", { class: "faint" }, ` · longest session today ${span(r.longest_session)}`) : null),
+      h("ul", { class: "event-list" }, r.recent.map((m) => h("li", {},
+        h("span", { class: "dot", "aria-hidden": "true" }), h("span", {}, h("span", { class: "mono" }, m.name), ` ${m.event}`),
+        h("span", { class: "faint" }, clock(m.t)))))) : null);
+  }
+  drawSwitch();
   await draw();
   const timer = setInterval(() => document.visibilityState === "visible" && draw(), 60_000);
-  return { el: box, stop: () => clearInterval(timer) };
+  return { el: root, stop: () => clearInterval(timer) };
 }
 
 // ----- can friends join? -------------------------------------------------------------------------

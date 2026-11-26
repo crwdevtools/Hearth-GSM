@@ -32,6 +32,11 @@ export function append(el, children) {
   return el;
 }
 
+// Like el.append(...children), but skips null, undefined and false (which el.append would print as text).
+export function appendAll(el, ...children) {
+  return append(el, children);
+}
+
 export function clear(el) {
   while (el.firstChild) el.firstChild.remove();
   return el;

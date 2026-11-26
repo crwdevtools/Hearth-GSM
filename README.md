@@ -46,7 +46,7 @@ simpler to set up. It's written in Python and runs everything in Docker.
 - **Worlds**: download a world as a zip, or upload a singleplayer world to replace it.
 - **Make a copy** of a server to try an update safely, **move it to another machine**, or
   **pause it for maintenance** (schedules, auto-updates and auto-sleep wait).
-- **Stats**: live CPU, memory, disk and network, plus 24-hour memory and CPU graphs.
+- **Stats**: live CPU, memory, disk and network, plus 1 hour / 24 hour / 7 day charts for CPU, memory, network speed and disk (with an estimate of when the quota fills). Minecraft servers also get players online, TPS and tick time, restarts and crashes, and recent joins and leaves.
 
 **Share them**
 - **Friends**: give someone access to one server with exactly the permissions you choose.

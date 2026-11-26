@@ -1,11 +1,11 @@
 import { del, get, post } from "../api.js";
-import { h, icon, replace } from "../dom.js";
+import { h, icon, replace, appendAll } from "../dom.js";
 import { ago, busy, confirmDialog, copyButton, emptyRow, field, notice, section, toast } from "../ui.js";
 import { currentLanguage, currentTheme, LANGUAGES, setLanguage, setTheme } from "../i18n.js";
 
 export async function renderAccount(root, { me, setCrumbs, refreshMe }) {
   setCrumbs([{ label: "Account" }]);
-  root.append(
+  appendAll(root, 
     h("div", { class: "page-head" }, h("div", {}, h("h1", {}, me.username),
       h("p", { class: "muted", style: { marginTop: "8px" } }, me.is_admin ? "Administrator"
         : me.max_servers ? `Member · can create up to ${me.max_servers} server${me.max_servers === 1 ? "" : "s"}` : "Member"))),

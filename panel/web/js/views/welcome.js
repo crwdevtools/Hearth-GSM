@@ -2,7 +2,7 @@
 // everything here can be changed later in Admin.
 
 import { get, put } from "../api.js";
-import { h, icon, replace } from "../dom.js";
+import { h, icon, replace, appendAll } from "../dom.js";
 import { busy, field, notice } from "../ui.js";
 
 export async function renderWelcome(root, { navigate, setCrumbs }) {
@@ -68,7 +68,7 @@ export async function renderWelcome(root, { navigate, setCrumbs }) {
     form.querySelector("input")?.focus();
   }
 
-  root.append(h("div", { class: "page-head" }, h("div", {}, h("h1", {}, "Welcome to Hearth"),
+  appendAll(root, h("div", { class: "page-head" }, h("div", {}, h("h1", {}, "Welcome to Hearth"),
     h("p", { class: "muted", style: { marginTop: "8px" } }, "Four quick steps. You can change all of this later in Admin."))),
   h("div", { class: "wizard" }, steps, body));
   draw();

@@ -116,6 +116,16 @@ def console(page: Page):
     expect(box).to_have_value("list")  # history survives a reload
 
 
+@step("console: statistics section and range switch")
+def console_stats(page: Page):
+    expect(page.get_by_role("heading", name="Statistics")).to_be_visible()
+    group = page.get_by_role("group", name="Time range")
+    expect(group.get_by_role("button", name="24 h")).to_have_attribute("aria-pressed", "true")
+    group.get_by_role("button", name="1 h").click()
+    expect(group.get_by_role("button", name="1 h")).to_have_attribute("aria-pressed", "true")
+    expect(page.locator(".chart").first).to_be_visible()
+
+
 @step("power: restart, stop, start")
 def power(page: Page):
     page.get_by_role("button", name="Restart").click()
@@ -455,7 +465,7 @@ def mods_tab(page: Page, sid: str):
 @step("stats charts render")
 def stats(page: Page, sid: str):
     page.goto(f"{BASE}/#/servers/{sid}/console")
-    expect(page.locator(".chart")).to_have_count(2, timeout=10_000)
+    expect(page.locator(".chart").nth(1)).to_be_visible(timeout=10_000)  # CPU and memory, plus the others a game reports
 
 
 @step("admin: activity log, user quota, tunnel")
@@ -574,6 +584,7 @@ def main() -> int:
         create_vanilla(page)
         sid = page.url.split("/servers/")[1].split("/")[0]
         console(page)
+        console_stats(page)
         power(page)
         files(page, sid)
         properties(page, sid)

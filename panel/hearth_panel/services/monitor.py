@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from sqlalchemy import select
 
 from ..models import Server
-from . import events, playtime
+from . import events, metrics, playtime
 from ..templates import get_template
 from .node_client import NodeError
 from .status import live_statuses, parse_player_list
@@ -20,6 +20,9 @@ log = logging.getLogger("hearth.monitor")
 
 INTERVAL = 15  # seconds between status sweeps
 PLAYER_CHECK = 60  # seconds between player counts for auto-sleep
+TICKS_IDLE = 300  # seconds between tick-speed reads while nobody is online (every PLAYER_CHECK when someone is)
+READING_FRESH = 400  # seconds a player count or tick reading counts as current
+TICK_GIVE_UP = 3  # unreadable replies in a row before a server is left alone (an old version, say)
 NODE_CHECK = 60  # seconds between node health checks
 OFFLINE_AFTER = 2  # failed node checks in a row before "node offline" is announced
 CRASH_LOOP = (3, 600)  # this many crashes within this many seconds: stop it and tell someone
@@ -39,6 +42,22 @@ class Seen:
     crashes: list[float] = field(default_factory=list)
     disk_level: int = 0  # 0 fine, 1 warned, 2 full (announce each step once)
     last_count: int | None = None  # players online at the last `list`, not yet acted on by auto-sleep
+    # What the console charts show, carried from one sweep to the next.
+    online: int | None = None
+    online_at: float | None = None
+    max_players: int | None = None
+    tps: float | None = None
+    mspt: float | None = None
+    ticks_at: float = -1e9
+    tick_cmd: str | None = None  # the command that worked on this server
+    tick_miss: int = 0
+    tick_off: bool = False
+    mspt_off: bool = False
+    metric_minute: int = 0
+
+
+CARRIED = ("online", "online_at", "max_players", "tps", "mspt", "ticks_at", "tick_cmd", "tick_miss", "tick_off",
+           "mspt_off", "metric_minute")
 
 
 @dataclass
@@ -77,6 +96,7 @@ class Monitor:
             if now - self.pruned > 86400:
                 self.pruned = now
                 playtime.prune(db)
+                metrics.prune(db)
 
     async def _check_nodes(self, db, now: float) -> None:
         from ..models import Node
@@ -124,6 +144,12 @@ class Monitor:
                                           prev.crashes if prev else [],
                                           prev.disk_level if prev else 0,
                                           prev.last_count if prev else None)
+        if prev is not None:
+            for name in CARRIED:
+                setattr(cur, name, getattr(prev, name))
+        if state != "running":  # a restart may bring a different version: read the ticks afresh
+            cur.online = cur.tps = cur.mspt = None
+            cur.tick_miss, cur.tick_off, cur.mspt_off, cur.tick_cmd = 0, False, False, None
         self._check_disk(db, server, st, cur)
         if prev is None:
             return  # first sight after a panel restart: no history to compare
@@ -156,6 +182,7 @@ class Monitor:
             await self._safe(server, lambda: self.ctx.nodes.power(server.node, server.uuid, "stop"))
             return
         await self._track_players(db, server, cur, prev, state, now)
+        self._record_metric(db, server, st, cur, state, now)
         if server.in_maintenance():
             cur.empty_since = None
             return
@@ -181,7 +208,51 @@ class Monitor:
         cur.last_player_check = now
         cur.players = parsed[2]
         cur.last_count = parsed[0]
+        cur.online, cur.online_at, cur.max_players = parsed[0], now, parsed[1]
         playtime.observe(db, server, parsed[2])
+        await self._track_ticks(server, cur, now)
+
+    async def _track_ticks(self, server: Server, cur: Seen, now: float) -> None:
+        """TPS and tick time through the console: each minute with someone on, every few minutes without."""
+        if server.template != "minecraft-java" or cur.tick_off:
+            return
+        if now - cur.ticks_at < (PLAYER_CHECK if cur.online else TICKS_IDLE):
+            return
+        cur.ticks_at = now
+        for command in ([cur.tick_cmd] if cur.tick_cmd else metrics.tick_commands(server)):
+            try:
+                output = await self.ctx.nodes.command(server.node, server.uuid, command)
+            except NodeError:
+                return
+            got = metrics.parse_ticks(command, output)
+            if got is None:
+                continue
+            cur.tick_cmd, cur.tick_miss = command, 0
+            tps, mspt = got
+            if command == "tps" and mspt is None and not cur.mspt_off:
+                try:
+                    mspt = (metrics.parse_ticks("mspt", await self.ctx.nodes.command(server.node, server.uuid, "mspt")) or (None, None))[1]
+                except NodeError:
+                    mspt = None
+                cur.mspt_off = mspt is None
+            cur.tps, cur.mspt = tps, mspt
+            return
+        cur.tick_miss += 1
+        cur.tick_off = cur.tick_miss >= TICK_GIVE_UP
+
+    def _record_metric(self, db, server: Server, st: dict, cur: Seen, state: str, now: float) -> None:
+        """One row a minute while it runs: what the console charts are drawn from."""
+        stamp = int(time.time())
+        minute = stamp // 60 * 60
+        if state != "running" or minute == cur.metric_minute:
+            return
+        cur.metric_minute = minute
+        fresh = lambda at: at is not None and now - at < READING_FRESH  # noqa: E731
+        net = st.get("network") or {}
+        metrics.record(db, server.id, stamp, cpu=st.get("cpu"), mem=st.get("memory"), disk=st.get("disk"),
+                       rx=net.get("rx"), tx=net.get("tx"),
+                       players=cur.online if fresh(cur.online_at) else None,
+                       tps=cur.tps if fresh(cur.ticks_at) else None, mspt=cur.mspt if fresh(cur.ticks_at) else None)
 
     def _check_disk(self, db, server: Server, st: dict, cur: Seen) -> None:
         if not server.disk_mb or "disk" not in st:
