@@ -46,6 +46,8 @@ ANNOUNCED: dict[str, tuple[int, str]] = {
     "server.crash_loop": (0xF2585C, "{server} keeps crashing and was stopped"),
     "server.disk_warning": (0xE9A23B, "{server} is almost at its disk limit"),
     "server.disk_full": (0xF2585C, "{server} is at its disk limit"),
+    "server.low_tps": (0xE9A23B, "{server} is lagging (low TPS)"),
+    "server.disk_filling": (0xE9A23B, "{server} will fill its disk soon"),
     "server.moved": (0x52A8FF, "{server} moved to another node"),
     "server.move_failed": (0xF2585C, "{server} couldn't be moved to another node"),
     "node.offline": (0xF2585C, "Node {node} is offline"),
@@ -59,7 +61,7 @@ EVENT_NAMES = sorted(ANNOUNCED)
 # Problems an admin should hear about: these also go to the admin alert channel
 # (Admin → Settings → Alerts), on top of the server's own Discord webhook.
 ALERTS = frozenset({"server.crashed", "server.out_of_memory", "server.crash_loop", "server.disk_warning",
-                    "server.disk_full", "backup.failed", "backup.offsite_failed", "schedule.failed",
+                    "server.disk_full", "server.low_tps", "server.disk_filling", "backup.failed", "backup.offsite_failed", "schedule.failed",
                     "mods.restore_failed", "node.offline", "node.online", "node.disk_low"})
 ALERT_WEBHOOK = "alerts.discord_webhook"
 

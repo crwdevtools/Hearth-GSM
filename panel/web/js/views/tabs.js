@@ -74,8 +74,8 @@ export async function statsSection(server) {
     const fill = fillEstimate(col(pts, "disk"), d.disk_limit);
     const out = [];
     if (n) {
-      out.push(tile("Players", n.players == null ? "—" : String(n.players), n.players == null ? "" : `/ ${n.max_players}`));
-      if (n.ticks_supported) out.push(tile("TPS", n.tps == null ? "—" : n.tps.toFixed(1), n.mspt == null ? "" : `${n.mspt.toFixed(1)} ms/tick`));
+      if (n.players != null) out.push(tile("Players", String(n.players), `/ ${n.max_players}`));
+      if (n.ticks_supported && n.tps != null) out.push(tile("TPS", n.tps.toFixed(1), n.mspt == null ? "" : `${n.mspt.toFixed(1)} ms/tick`));
     }
     if (has("rx") || has("tx")) out.push(tile("Network", `↓ ${rate(last("rx"))}`, `↑ ${rate(last("tx"))}`));
     if (fill) out.push(tile("Disk fills", fill.days > 365 ? "> 1 year" : fill.days < 1 ? "< 1 day" : `~${Math.round(fill.days)} d`, `+${bytes(fill.perDay)}/day`));

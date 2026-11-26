@@ -118,3 +118,63 @@ async def test_monitor_records_a_row_with_players_and_tps(admin, node, agent):
     assert rows[0].players in (2, None) and rows[0].cpu is not None
     body = admin.get(f"/api/servers/{sid}/series?range=1h").json()
     assert body["now"]["ticks_supported"] is True
+
+
+# ----- the status ping -----------------------------------------------------------------------------
+
+@pytest.mark.anyio
+async def test_status_ping_reads_player_counts():
+    import asyncio
+    import json
+
+    from hearth_panel.services import mcping
+
+    body = json.dumps({"players": {"online": 3, "max": 20}}).encode()
+    payload = b"\x00" + mcping._varint(len(body)) + body
+
+    async def handle(reader, writer):
+        await reader.read(64)
+        writer.write(mcping._packet(payload))
+        await writer.drain()
+        writer.close()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    async with server:
+        assert await mcping.ping("127.0.0.1", port) == (3, 20)
+    assert await mcping.ping("127.0.0.1", port, timeout=0.5) is None  # closed now
+
+
+# ----- alerts --------------------------------------------------------------------------------------
+
+def test_disk_days_left_follows_growth(admin, node, agent):
+    sid = _create(admin, node, disk_mb=1000)["id"]
+    now = int(time.time()) // 60 * 60
+    gb = 1048576
+    # 100 MB of growth over 12 hours, 900 MB to go: about 5.4 days
+    _rows(admin, sid, [(now - 43200 + i * 720, {"disk": 400 * gb + i * (100 * gb) // 60}) for i in range(61)])
+    with _db(admin) as db:
+        days = metrics.disk_days_left(db, db.get(Server, sid), now=now)
+    assert days is not None and 2.4 < days < 2.6  # 500 MB left at ~200 MB/day
+
+
+def test_low_tps_alert_fires_once(admin, node, agent):
+    from types import SimpleNamespace
+
+    sid = _create(admin, node)["id"]
+    monitor = admin.app.state.monitor
+    cur = SimpleNamespace(tps=10.0, low_tps_run=0, low_tps_sent=False, fill_checked=1e12, fill_sent=False)
+    with _db(admin) as db:
+        server = db.get(Server, sid)
+        for _ in range(7):
+            monitor._metric_alerts(db, server, cur, 0.0, True)
+    actions = [e["action"] for e in admin.get(f"/api/servers/{sid}/activity").json()]
+    assert actions.count("server.low_tps") == 1
+
+
+def test_parse_realistic_replies():
+    vanilla = ("The game is running normally\nStated tick rate: 20.0 per second\nTarget tick rate: 20.0 per second (50.0 ms per tick)\n"
+               "Average time per tick: 2.9 ms (Target: 50.0 ms)\nPercentiles: P50: 2.4 ms P95: 6.1 ms P99: 9.0 ms, sample: 100")
+    assert metrics.parse_ticks("tick query", vanilla) == (20.0, 2.9)
+    forge = "Dim  0 (minecraft:overworld): Mean tick time: 5.1 ms. Mean TPS: 20.0\nOverall: Mean tick time: 5.8 ms. Mean TPS: 20.0"
+    assert metrics.parse_ticks("forge tps", forge) == (20.0, 5.8)

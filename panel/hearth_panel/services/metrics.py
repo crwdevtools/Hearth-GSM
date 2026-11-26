@@ -143,6 +143,24 @@ def series(db: Session, server: Server, span: str = "24h", now: float | None = N
     return {"range": span, "step": step, "points": points}
 
 
+def disk_days_left(db: Session, server: Server, now: float | None = None) -> float | None:
+    """Days until the disk quota is used up at the last day's growth rate; None when it isn't growing."""
+    if not server.disk_mb:
+        return None
+    now = int(now if now is not None else time.time())
+    rows = list(db.execute(select(ServerMetric.ts, ServerMetric.disk).where(
+        ServerMetric.server_id == server.id, ServerMetric.ts >= now - 86400, ServerMetric.disk.is_not(None)).order_by(ServerMetric.ts)))
+    if len(rows) < 60 or rows[-1][0] - rows[0][0] < 6 * 3600:
+        return None
+    n = len(rows)
+    mt, mv = sum(r[0] for r in rows) / n, sum(r[1] for r in rows) / n
+    den = sum((r[0] - mt) ** 2 for r in rows)
+    slope = sum((r[0] - mt) * (r[1] - mv) for r in rows) / den if den else 0
+    if slope <= 0:
+        return None
+    return max(0.0, (server.disk_mb * 1048576 - rows[-1][1]) / slope / 86400)
+
+
 def peak_players(db: Session, server: Server, hours: int = 24, now: float | None = None) -> int | None:
     since = int(now if now is not None else time.time()) - hours * 3600
     return db.scalar(select(func.max(ServerMetric.players)).where(ServerMetric.server_id == server.id, ServerMetric.ts >= since))

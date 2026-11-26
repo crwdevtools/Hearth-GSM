@@ -7,6 +7,11 @@ machines need their agent updated too (Admin → Nodes says when one is behind).
 ## Unreleased
 
 ### Added
+- Player counts now come from a Minecraft status ping, so an empty server no longer gets a `list`
+  command (and a log line) every minute; `list` runs only when the count changes or every 5 minutes
+  while players are on, and whenever the ping can't reach the server.
+- Alerts (Discord webhooks and the admin alert channel): TPS under 15 for 5 minutes, and a disk
+  that will reach its limit within 3 days at the last day's growth.
 - Console statistics: 1 h / 24 h / 7 d range switch; players online with the day's peak, TPS and
   tick time (Paper `tps`, vanilla/Fabric/NeoForge `tick query`, Forge `forge tps`; a server that
   doesn't answer is left alone), network speed, disk growth with a "fills in about N days" estimate,

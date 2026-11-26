@@ -11,7 +11,8 @@ from dataclasses import dataclass, field
 from sqlalchemy import select
 
 from ..models import Server
-from . import events, metrics, playtime
+from . import events, mcping, metrics, playtime
+from urllib.parse import urlsplit
 from ..templates import get_template
 from .node_client import NodeError
 from .status import live_statuses, parse_player_list
@@ -20,6 +21,10 @@ log = logging.getLogger("hearth.monitor")
 
 INTERVAL = 15  # seconds between status sweeps
 PLAYER_CHECK = 60  # seconds between player counts for auto-sleep
+LIST_EVERY = 300  # seconds between full `list` reads while players are online and the ping count is steady
+LOW_TPS = 15.0  # TPS under this for LOW_TPS_MINUTES recorded minutes in a row raises an alert
+LOW_TPS_MINUTES = 5
+FILL_WARN_DAYS = 3
 TICKS_IDLE = 300  # seconds between tick-speed reads while nobody is online (every PLAYER_CHECK when someone is)
 READING_FRESH = 400  # seconds a player count or tick reading counts as current
 TICK_GIVE_UP = 3  # unreadable replies in a row before a server is left alone (an old version, say)
@@ -45,6 +50,7 @@ class Seen:
     # What the console charts show, carried from one sweep to the next.
     online: int | None = None
     online_at: float | None = None
+    list_at: float = -1e9
     max_players: int | None = None
     tps: float | None = None
     mspt: float | None = None
@@ -54,10 +60,14 @@ class Seen:
     tick_off: bool = False
     mspt_off: bool = False
     metric_minute: int = 0
+    low_tps_run: int = 0
+    low_tps_sent: bool = False
+    fill_checked: float = -1e9
+    fill_sent: bool = False
 
 
-CARRIED = ("online", "online_at", "max_players", "tps", "mspt", "ticks_at", "tick_cmd", "tick_miss", "tick_off",
-           "mspt_off", "metric_minute")
+CARRIED = ("online", "online_at", "list_at", "max_players", "tps", "mspt", "ticks_at", "tick_cmd", "tick_miss", "tick_off",
+           "mspt_off", "metric_minute", "low_tps_run", "low_tps_sent", "fill_checked", "fill_sent")
 
 
 @dataclass
@@ -199,18 +209,38 @@ class Monitor:
             return
         if now - cur.last_player_check < PLAYER_CHECK:
             return
+        cur.last_player_check = now
+        pinged = await self._ping(server)
+        if pinged is not None and pinged[0] == cur.online == 0 and cur.players == [] and now - cur.online_at < READING_FRESH:
+            # Still empty: no console command needed (keeps the server log quiet).
+            cur.online_at, cur.max_players = now, pinged[1]
+            cur.last_count = 0
+            playtime.observe(db, server, [])
+            await self._track_ticks(server, cur, now)
+            return
+        if pinged is not None and pinged[0] == cur.online and cur.players and now - cur.list_at < LIST_EVERY:
+            cur.online_at, cur.max_players = now, pinged[1]  # same head-count: names haven't changed much
+            await self._track_ticks(server, cur, now)
+            return
         try:
             parsed = parse_player_list(await self.ctx.nodes.command(server.node, server.uuid, "list"))
         except NodeError:
             return
         if parsed is None:
             return
-        cur.last_player_check = now
+        cur.list_at = now
         cur.players = parsed[2]
         cur.last_count = parsed[0]
         cur.online, cur.online_at, cur.max_players = parsed[0], now, parsed[1]
         playtime.observe(db, server, parsed[2])
         await self._track_ticks(server, cur, now)
+
+    async def _ping(self, server: Server) -> tuple[int, int] | None:
+        if server.template != "minecraft-java":
+            return None
+        port = next((a.port for a in server.allocations if a.is_primary), None) or (server.allocations[0].port if server.allocations else None)
+        host = urlsplit(server.node.url).hostname
+        return await mcping.ping(host, port) if host and port else None
 
     async def _track_ticks(self, server: Server, cur: Seen, now: float) -> None:
         """TPS and tick time through the console: each minute with someone on, every few minutes without."""
@@ -253,6 +283,27 @@ class Monitor:
                        rx=net.get("rx"), tx=net.get("tx"),
                        players=cur.online if fresh(cur.online_at) else None,
                        tps=cur.tps if fresh(cur.ticks_at) else None, mspt=cur.mspt if fresh(cur.ticks_at) else None)
+        self._metric_alerts(db, server, cur, now, fresh(cur.ticks_at))
+
+    def _metric_alerts(self, db, server: Server, cur: Seen, now: float, have_tps: bool) -> None:
+        """Tell the admin about lag that lasts, and about a disk that will fill within days."""
+        if have_tps and cur.tps is not None:
+            cur.low_tps_run = cur.low_tps_run + 1 if cur.tps < LOW_TPS else 0
+            if cur.tps >= LOW_TPS + 3:
+                cur.low_tps_sent = False
+            if cur.low_tps_run >= LOW_TPS_MINUTES and not cur.low_tps_sent:
+                cur.low_tps_sent = True
+                events.emit(self.ctx, db, "server.low_tps", server=server,
+                            detail=f"TPS has stayed under {LOW_TPS:g} for {LOW_TPS_MINUTES} minutes (now {cur.tps:g}).")
+        if now - cur.fill_checked >= 3600:
+            cur.fill_checked = now
+            days = metrics.disk_days_left(db, server)
+            if days is not None and days < FILL_WARN_DAYS and not cur.fill_sent:
+                cur.fill_sent = True
+                events.emit(self.ctx, db, "server.disk_filling", server=server,
+                            detail=f"At this rate the disk limit is reached in about {max(1, round(days))} day(s).")
+            elif days is None or days > FILL_WARN_DAYS * 2:
+                cur.fill_sent = False
 
     def _check_disk(self, db, server: Server, st: dict, cur: Seen) -> None:
         if not server.disk_mb or "disk" not in st:

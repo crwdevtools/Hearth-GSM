@@ -87,6 +87,39 @@ def serve(app, port: int) -> None:
     threading.Thread(target=uvicorn.Server(config).run, daemon=True).start()
 
 
+def seed_history(context, server_id: int) -> None:
+    """A made-up week of charts for the first server, so the console statistics have something to show."""
+    import math
+    from datetime import datetime, timedelta, timezone
+
+    from hearth_panel.models import AuditLog, PlayerSession, ServerMetric
+
+    now = int(time.time()) // 60 * 60
+    gib = 1024 ** 3
+    rx = tx = 0
+    rows = []
+    for i in range(7 * 24 * 60, 0, -1):
+        ts = now - i * 60
+        if now - 26 * 3600 < ts < now - 26 * 3600 + 1500:
+            continue  # a crash and restart
+        players = max(0, round(3.5 + 3 * math.sin((ts / 3600 - 14) / 24 * 2 * math.pi) + ((ts // 2400) % 3 - 1) * 0.6))
+        rx += 800 + players * 2600 + (ts % 7) * 90
+        tx += 2400 + players * 9000 + (ts % 11) * 200
+        rows.append(ServerMetric(server_id=server_id, ts=ts, cpu=8 + players * 4 + (ts // 300) % 3, mem=int((2.6 + players * 0.15 + (ts // 900 % 4) * 0.03) * gib),
+                                 disk=int(1.4 * gib + (7 * 24 * 60 - i) * 60_000), rx=rx, tx=tx, players=players,
+                                 tps=20.0 if players < 6 or ts % 13 else 18.7, mspt=6 + players * 2.5))
+    names = ["Alex", "Sam", "Jordan", "Riley"]
+    stamp = datetime.now(timezone.utc)
+    with context.db.sessionmaker() as db:
+        db.add_all(rows)
+        db.add_all([AuditLog(action="server.crashed", server_id=server_id, detail="Docker restarted it (crash #1).", at=stamp - timedelta(hours=26)),
+                    AuditLog(action="server.started", server_id=server_id, detail="", at=stamp - timedelta(hours=26) + timedelta(minutes=25))])
+        for k, name in enumerate(names):
+            db.add(PlayerSession(server_id=server_id, name=name, joined_at=stamp - timedelta(hours=5 - k, minutes=10 * k),
+                                 left_at=None if k == 0 else stamp - timedelta(hours=3 - k * 0.7)))
+        db.commit()
+
+
 def main() -> None:
     tmp = Path(tempfile.mkdtemp(prefix="hearth-demo-"))
     settings = Settings.from_env()
@@ -125,6 +158,7 @@ def main() -> None:
     c.post("/api/servers", json={**base, "node_id": remote["id"], "name": "EU Lobby", "template": "minecraft-java",
                                  "memory_mb": 2048, "variables": {"TYPE": "PURPUR", "VERSION": "1.21.4"}})
     c.post("/api/servers/2/updates/check")
+    seed_history(context, 1)
     print("Hearth demo running at http://127.0.0.1:8000  (admin / demo-password-123)")
     try:
         while True:
