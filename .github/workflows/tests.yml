@@ -73,7 +73,7 @@ jobs:
           $env:DOCKER_CALLS = "$env:RUNNER_TEMP\calls.txt"
           $env:HEARTH_NONINTERACTIVE = "1"
           Start-Process python -ArgumentList "tools/ci/stub_panel.py", "8000" -NoNewWindow
-          cmd /c start.bat
+          cmd /c ".\start.bat"
           if ($LASTEXITCODE -ne 0) { throw "start.bat failed on the first run" }
           $envText = Get-Content .env -Raw
           if ($envText -notmatch '(?m)^HEARTH_AGENT_TOKEN=[0-9a-f]{64}\r?$') { throw "no token in .env" }
@@ -81,6 +81,6 @@ jobs:
           $calls = Get-Content $env:DOCKER_CALLS -Raw
           if ($calls -notmatch 'compose build --pull' -or $calls -notmatch 'compose up -d') { throw "docker wasn't called as expected: $calls" }
           Copy-Item .env.example .env -Force
-          cmd /c start.bat
+          cmd /c ".\start.bat"
           if ($LASTEXITCODE -ne 0) { throw "start.bat failed with a hand-made .env" }
           if ((Get-Content .env -Raw) -notmatch '(?m)^HEARTH_AGENT_TOKEN=[0-9a-f]{64}\r?$') { throw "empty token wasn't filled" }

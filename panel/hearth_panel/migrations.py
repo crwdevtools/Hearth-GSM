@@ -19,7 +19,9 @@ log = logging.getLogger("hearth.migrations")
 
 
 def upgrade(engine: Engine) -> list[str]:
-    from . import models  # noqa: F401  (register tables)
+    from . import models  # registers the tables on Base
+
+    del models
 
     Base.metadata.create_all(engine)
     added: list[str] = []
