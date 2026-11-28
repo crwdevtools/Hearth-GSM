@@ -28,8 +28,9 @@ jobs:
       - name: Browser click-through against the demo
         run: |
           python -m playwright install --with-deps chromium
-          python tools/demo.py > demo.log 2>&1 &
-          for i in $(seq 60); do curl -fs http://127.0.0.1:8000/api/auth/state >/dev/null && break; sleep 1; done
+          python -u tools/demo.py > demo.log 2>&1 &
+          for i in $(seq 90); do grep -q "demo running" demo.log && break; sleep 1; done
+          grep -q "demo running" demo.log
           python tools/e2e.py
       - if: failure()
         run: cat demo.log || true
@@ -72,6 +73,8 @@ jobs:
           $env:PATH = "$PWD\tools\ci;$env:PATH"
           $env:DOCKER_CALLS = "$env:RUNNER_TEMP\calls.txt"
           $env:HEARTH_NONINTERACTIVE = "1"
+          & "$env:windir\Microsoft.NET\Framework64\v4.0.30319\csc.exe" /nologo /out:tools\ci\docker.exe tools\ci\docker.cs
+          if ($LASTEXITCODE -ne 0) { throw "couldn't build the stand-in docker.exe" }
           Start-Process python -ArgumentList "tools/ci/stub_panel.py", "8000" -NoNewWindow
           cmd /c ".\start.bat"
           if ($LASTEXITCODE -ne 0) { throw "start.bat failed on the first run" }
