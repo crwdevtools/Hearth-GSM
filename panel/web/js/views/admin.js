@@ -2,7 +2,7 @@
 
 import { del, get, patch, post, put } from "../api.js";
 import { h, icon, replace, appendAll } from "../dom.js";
-import { busy, bytes, confirmDialog, copyButton, download, emptyRow, fail, field, mb, notice, section, skeletonRows, suffixed, toast } from "../ui.js";
+import { busy, bytes, confirmDialog, copyButton, download, emptyRow, fail, field, mb, notice, section, safeUrl, skeletonRows, suffixed, toast } from "../ui.js";
 import { activityList } from "./tabs.js";
 
 const SECTIONS = [["overview", "Overview", "layers"], ["nodes", "Nodes", "server"], ["users", "Users", "users"],
@@ -40,7 +40,7 @@ async function overview(root) {
     overview(root);
   }));
   const update = data.update ? notice("info", h("span", {}, `Hearth ${data.update.version} is available (you have ${data.version}). `,
-    data.update.url ? h("a", { class: "link", href: data.update.url, target: "_blank", rel: "noopener noreferrer" }, "What's new") : null,
+    safeUrl(data.update.url) ? h("a", { class: "link", href: safeUrl(data.update.url), target: "_blank", rel: "noopener noreferrer" }, "What's new") : null,
     " · Update with git pull, then start.sh or start.bat.")) : null;
   appendAll(root, head("Overview", "What this panel manages."), update,
     h("dl", { class: "facts", style: { fontSize: "14px" } },

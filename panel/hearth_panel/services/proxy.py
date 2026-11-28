@@ -56,7 +56,7 @@ def rewrite_velocity_toml(text: str, servers_block: str) -> str:
     """Replace the [servers] table and switch forwarding to modern. Everything else is kept."""
     out, skipping, replaced = [], False, False
     for line in text.splitlines(keepends=True):
-        header = re.match(r"\s*\[([^\]]+)\]\s*$", line)
+        header = re.match(r"\s*\[([^\]]+)\]\s*(?:#.*)?$", line)  # a trailing comment is still a header
         if header:
             if header.group(1).strip() == "servers":
                 out.append(servers_block + "\n")

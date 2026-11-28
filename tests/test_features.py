@@ -1271,3 +1271,15 @@ async def test_monitor_records_who_is_online(admin, node, agent):
     agent.state = "offline"
     await monitor.tick(now=30)
     assert not admin.get(f"/api/servers/{sid}/players/stats").json()["players"][0]["online"]
+
+
+def test_velocity_rewrite_handles_comments_after_table_headers():
+    from hearth_panel.services.proxy import rewrite_velocity_toml
+
+    text = ('player-info-forwarding-mode = "none"\n[servers]  # my servers\nlobby = "127.0.0.1:25565"\n'
+            'try = ["lobby"]\n[forced-hosts] # hosts\n"a.b" = ["lobby"]\n')
+    out = rewrite_velocity_toml(text, '[servers]\nsurv = "x:1"\ntry = ["surv"]\n')
+    assert out.count("[servers]") == 1  # replaced, not duplicated (a duplicate table breaks Velocity)
+    assert 'lobby = "127.0.0.1' not in out and 'surv = "x:1"' in out
+    assert "[forced-hosts] # hosts" in out and '"a.b" = ["lobby"]' in out
+    assert 'player-info-forwarding-mode = "modern"' in out
